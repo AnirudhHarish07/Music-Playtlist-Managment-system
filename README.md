@@ -83,7 +83,9 @@ browser with DRM support (**Chrome or Edge** recommended; Safari/Firefox may wor
    add the name and **Spotify account email** of everyone who will log in (up to 5, all Premium).
    Users who are not listed get a "403 / not registered" error after login.
 7. Start the server, open <http://127.0.0.1:8080>, click **Login with Spotify**, accept the scopes
-   (`streaming user-read-email user-read-private user-playback-state user-modify-playback-state`).
+   (`streaming user-read-email user-read-private user-modify-playback-state`).
+   (`user-playback-state` is deliberately not requested: it is not needed, and Spotify answered `invalid_scope`
+   for it on a Development Mode app.)
 
 Login uses **Authorization Code with PKCE**; tokens are kept in the browser's `localStorage` and refreshed
 automatically a minute before they expire.

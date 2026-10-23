@@ -14,7 +14,7 @@
 
   var cfg = window.SPOTIFY_CONFIG || {};
   var REDIRECT_URI = cfg.redirectUri || 'http://127.0.0.1:8080/callback';
-  var SCOPES = 'streaming user-read-email user-read-private user-playback-state user-modify-playback-state';
+  var SCOPES = 'streaming user-read-email user-read-private user-modify-playback-state';
   var AUTH_URL = 'https://accounts.spotify.com/authorize';
   var TOKEN_URL = 'https://accounts.spotify.com/api/token';
   var API = 'https://api.spotify.com/v1';
