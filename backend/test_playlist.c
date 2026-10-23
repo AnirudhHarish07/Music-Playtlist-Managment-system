@@ -68,7 +68,9 @@ int main(void)
     assert(pl_add_end(&pl, "  ", "x", 10, NULL) == PL_ERR_INVALID);
     assert(pl_add_end(&pl, "T", "", 10, NULL) == PL_ERR_INVALID);
     assert(pl_add_end(&pl, "T", "x", 0, NULL) == PL_ERR_INVALID);
-    assert(pl_add_end(&pl, "T|x", "x", 5, NULL) == PL_ERR_INVALID);
+    assert(pl_add_end(&pl, "T|x", "x", 5, NULL) == PL_OK);               /* '|' is allowed now */
+    assert(pl_delete_by_title(&pl, "T|x") == PL_OK);
+    pl.nextId--;                                                        /* keep id arithmetic below simple */
     assert(pl.count == 6 && pl.nextId == 7);                            /* failures burn no ids */
 
     /* search */
@@ -115,6 +117,72 @@ int main(void)
       titles(&q, b2); assert(!strcmp(buf, b2)); assert(q.count == pl.count);
       assert(pl_load(&q, "/nonexistent/file") == PL_ERR_IO && q.count == pl.count);
       pl_free(&q); }
+
+    /* ---- Spotify / local fields ---- */
+    {
+        const char *U1 = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
+        const char *U2 = "spotify:track:7qiZfU4dY1lWllzX7mPBI3";
+        SongInfo s = { "Sp One", "Artist", 200, U1, "https://i.scdn.co/image/abc", NULL, NULL };
+        Playlist q; int sid = 0; pl_init(&q);
+
+        assert(pl_add_end_info(&q, &s, &sid) == PL_OK);
+        assert(!strcmp(q.head->source, "spotify"));                      /* inferred from the URI */
+        assert(!strcmp(q.head->spotify_uri, U1) && !strcmp(q.head->image_url, s.image_url));
+        assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_DUPLICATE);       /* same URI */
+        s.title = "Sp One"; s.spotify_uri = U2;
+        assert(pl_add_start_info(&q, &s, NULL) == PL_OK);                /* same title, other URI: fine */
+        assert(q.count == 2);
+
+        s.spotify_uri = "spotify:track:short";   assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.spotify_uri = "spotify:album:4cOdK2wGLETKBW3PvgPWqT";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.spotify_uri = "spotify:track:4cOdK2wGLETKBW3PvgPW!T"; assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.spotify_uri = "";                       s.source = "spotify";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);  /* spotify needs a URI */
+        s.source = "tape"; s.spotify_uri = U2;    assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.source = NULL;   s.image_url = "http://insecure/x.jpg";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.image_url = NULL; s.audio_url = "/music/a.mp3";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);  /* spotify + audio */
+        assert(q.count == 2);
+
+        { SongInfo l = { "Local Tune", "Me", 90, NULL, NULL, NULL, "/music/Local%20Tune.mp3" };
+          assert(pl_add_end_info(&q, &l, NULL) == PL_OK && !strcmp(q.tail->source, "local"));
+          l.title = "local tune";   assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_DUPLICATE);   /* local: by title */
+          l.title = "Other"; l.audio_url = "/etc/passwd";   assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_INVALID);
+          l.audio_url = "/music/../secret.mp3";             assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_INVALID);
+          l.audio_url = NULL; l.spotify_uri = U2; l.source = "local";
+                                                            assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_INVALID);
+          l.spotify_uri = NULL; l.title = "Sp One";          /* a local song may share a Spotify song's title */
+          assert(pl_add_end_info(&q, &l, NULL) == PL_OK); }
+        assert(q.count == 4); check(&q);
+
+        /* save/load keeps every field, including '|' in a title */
+        { SongInfo p = { "Pipe | Title", "A | B", 61, U1 + 0, NULL, NULL, NULL };
+          Playlist r; char b1[512], b2[512]; pl_init(&r);
+          p.spotify_uri = "spotify:track:1111111111111111111111";
+          assert(pl_add_end_info(&q, &p, NULL) == PL_OK);
+          assert(pl_save(&q, "/tmp/pl_test2.txt") == PL_OK);
+          assert(pl_load(&r, "/tmp/pl_test2.txt") == PL_OK); check(&r);
+          assert(r.count == q.count);
+          for (const Song *a = q.head, *b = r.head; a; a = a->next, b = b->next) {
+              assert(!strcmp(a->title, b->title) && !strcmp(a->artist, b->artist));
+              assert(a->duration == b->duration && !strcmp(a->spotify_uri, b->spotify_uri));
+              assert(!strcmp(a->image_url, b->image_url) && !strcmp(a->source, b->source));
+              assert(!strcmp(a->audio_url, b->audio_url));
+          }
+          titles(&q, b1); titles(&r, b2); assert(!strcmp(b1, b2));
+          pl_free(&r); }
+
+        /* legacy pipe format + garbage lines */
+        { FILE *f = fopen("/tmp/pl_test3.txt", "w"); Playlist r; pl_init(&r);
+          fputs("Old Song|Old Artist|120\n# comment\n\nbroken line\nBad|x|abc\nlocal\tonly\tthree\n", f);
+          fclose(f);
+          assert(pl_load(&r, "/tmp/pl_test3.txt") == PL_OK && r.count == 1);
+          assert(!strcmp(r.head->source, "local") && r.head->duration == 120); check(&r);
+          pl_free(&r); }
+        pl_free(&q); check(&q);
+    }
 
     /* single song, then delete everything */
     while (pl.head) { assert(pl_delete_by_id(&pl, pl.head->id) == PL_OK); check(&pl); }

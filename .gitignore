@@ -3,3 +3,9 @@ backend/server
 backend/server.exe
 backend/test_playlist
 backend/test_playlist.exe
+# Spotify Client ID lives here (copy frontend/config.example.js)
+frontend/config.js
+# local music is not committed
+music/*
+!music/.gitkeep
+!music/README.md

@@ -10,11 +10,11 @@
 <body>
   <header class="topbar">
     <h1>&#9835; Playlist Manager</h1>
-    <p class="subtitle">Doubly linked list in C &middot; REST API &middot; vanilla JS</p>
+    <p class="subtitle">Doubly linked list in C &middot; REST API &middot; Spotify playback</p>
   </header>
 
   <main class="layout">
-    <!-- LEFT: playlist -->
+    <!-- Playlist (order and Next/Previous come from the C linked list) -->
     <section class="panel playlist-panel">
       <div class="panel-head">
         <h2>Playlist</h2>
@@ -25,7 +25,7 @@
       </div>
 
       <div class="toolbar">
-        <input id="search" type="search" placeholder="Search title or artist..." aria-label="Search songs">
+        <input id="search" type="search" placeholder="Filter playlist by title or artist..." aria-label="Filter playlist">
         <button id="btn-reverse" title="Reverse the list in place (swaps prev/next pointers)">Reverse</button>
         <button id="btn-view-reverse" title="Show the list from the tail using prev pointers (does not change it)">View reversed</button>
         <select id="sort-by" aria-label="Sort by">
@@ -52,49 +52,91 @@
       </div>
     </section>
 
-    <!-- RIGHT: player + add form -->
-    <aside class="side">
-      <section class="panel now-playing">
-        <h2>Now Playing</h2>
-        <div class="disc" id="disc" aria-hidden="true">&#9835;</div>
-        <div id="np-title" class="np-title">Nothing playing</div>
-        <div id="np-artist" class="np-artist">&mdash;</div>
-        <div class="progress" aria-hidden="true"><div id="progress-bar" class="progress-bar"></div></div>
-        <div class="times"><span id="np-elapsed">0:00</span><span id="np-length">0:00</span></div>
-        <div class="controls">
-          <button id="btn-prev" aria-label="Previous">&#9198;</button>
-          <button id="btn-play" class="primary" aria-label="Play or pause">&#9654;</button>
-          <button id="btn-next" aria-label="Next">&#9197;</button>
-          <button id="btn-repeat" aria-pressed="false" title="Repeat: wrap around at the ends">&#8635; Repeat</button>
-        </div>
-      </section>
+    <!-- Now playing -->
+    <section class="panel now-playing">
+      <h2>Now Playing</h2>
+      <div class="art" id="art"><img id="art-img" alt="" hidden><span id="art-ph" class="art-ph">&#9835;</span></div>
+      <div id="np-title" class="np-title">Nothing playing</div>
+      <div id="np-artist" class="np-artist">&mdash;</div>
+      <input id="seek" class="slider" type="range" min="0" max="0" value="0" step="1" aria-label="Seek" disabled>
+      <div class="times"><span id="np-elapsed">00:00</span><span id="np-length">00:00</span></div>
+      <div class="controls">
+        <button id="btn-prev" aria-label="Previous">&#9198;</button>
+        <button id="btn-play" class="primary" aria-label="Play or pause">&#9654;</button>
+        <button id="btn-next" aria-label="Next">&#9197;</button>
+        <button id="btn-repeat" aria-pressed="false" title="Repeat: wrap around at the ends">&#8635; Repeat</button>
+      </div>
+      <label class="volume">&#128266;
+        <input id="volume" class="slider" type="range" min="0" max="100" value="80" aria-label="Volume">
+      </label>
+    </section>
 
-      <section class="panel">
-        <h2>Add a song</h2>
-        <form id="add-form" autocomplete="off">
-          <label>Title <input id="f-title" required maxlength="99"></label>
-          <label>Artist <input id="f-artist" required maxlength="99"></label>
-          <div class="row">
-            <label>Minutes <input id="f-min" type="number" min="0" max="599" value="3" required></label>
-            <label>Seconds <input id="f-sec" type="number" min="0" max="59" value="0" required></label>
-          </div>
-          <div class="row">
-            <label>Insert
-              <select id="f-at">
-                <option value="end">At the end</option>
-                <option value="start">At the start</option>
-                <option value="position">At position...</option>
-              </select>
-            </label>
-            <label id="pos-label" hidden>Position <input id="f-pos" type="number" min="1" value="1"></label>
-          </div>
-          <button type="submit" class="primary wide">Add song</button>
-        </form>
-      </section>
-    </aside>
+    <!-- Find songs: Spotify search + local MP3s -->
+    <section class="panel find-panel">
+      <div class="panel-head">
+        <h2>Find songs</h2>
+        <div class="auth">
+          <span id="sp-user" class="sp-user" hidden></span>
+          <button id="sp-login" class="primary">Login with Spotify</button>
+          <button id="sp-logout" hidden>Log out</button>
+        </div>
+      </div>
+      <div id="sp-banner" class="banner" hidden></div>
+
+      <form id="sp-form" autocomplete="off">
+        <input id="sp-q" type="search" placeholder="Search Spotify tracks..." aria-label="Search Spotify">
+        <button type="submit">Search</button>
+      </form>
+
+      <div class="insert-bar">
+        <label>Add to
+          <select id="ins-at" aria-label="Where to insert">
+            <option value="end">the end</option>
+            <option value="start">the start</option>
+            <option value="position">position...</option>
+          </select>
+        </label>
+        <label id="ins-pos-label" hidden><input id="ins-pos" type="number" min="1" value="1" aria-label="Position"></label>
+      </div>
+
+      <ul id="sp-results" class="results"></ul>
+      <button id="sp-more" class="wide" hidden>Load more</button>
+
+      <h3>Local MP3s <small>(files in the <code>music/</code> folder)</small>
+        <button id="local-refresh" class="small">Refresh</button></h3>
+      <ul id="local-list" class="results"></ul>
+      <p id="local-empty" class="empty small" hidden>No MP3 files found. Put some in the <code>music/</code> folder.</p>
+    </section>
+
+    <!-- Manual add (no audio) -->
+    <section class="panel add-panel">
+      <h2>Add manually <small>(no audio)</small></h2>
+      <form id="add-form" autocomplete="off">
+        <label>Title <input id="f-title" required maxlength="99"></label>
+        <label>Artist <input id="f-artist" required maxlength="99"></label>
+        <div class="row">
+          <label>Minutes <input id="f-min" type="number" min="0" max="599" value="3" required></label>
+          <label>Seconds <input id="f-sec" type="number" min="0" max="59" value="0" required></label>
+        </div>
+        <div class="row">
+          <label>Insert
+            <select id="f-at">
+              <option value="end">At the end</option>
+              <option value="start">At the start</option>
+              <option value="position">At position...</option>
+            </select>
+          </label>
+          <label id="pos-label" hidden>Position <input id="f-pos" type="number" min="1" value="1"></label>
+        </div>
+        <button type="submit" class="primary wide">Add song</button>
+      </form>
+    </section>
   </main>
 
+  <audio id="audio" preload="none"></audio>
   <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="config.js"></script>
+  <script src="spotify.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

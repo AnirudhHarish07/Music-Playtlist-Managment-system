@@ -23,6 +23,10 @@
 
 #define PL_TITLE_MAX  100
 #define PL_ARTIST_MAX 100
+#define PL_URI_MAX    100
+#define PL_IMAGE_MAX  300
+#define PL_SOURCE_MAX 10
+#define PL_AUDIO_MAX  300
 
 /* One song = one node of the doubly linked list. */
 typedef struct Song {
@@ -30,6 +34,10 @@ typedef struct Song {
     char title[PL_TITLE_MAX];
     char artist[PL_ARTIST_MAX];
     int  duration;              /* seconds */
+    char spotify_uri[PL_URI_MAX];   /* "spotify:track:<id>" ("" for local)   */
+    char image_url[PL_IMAGE_MAX];   /* album art URL, may be ""              */
+    char source[PL_SOURCE_MAX];     /* "spotify" or "local"                  */
+    char audio_url[PL_AUDIO_MAX];   /* "/music/<file>.mp3" for local, or ""  */
     struct Song *prev;
     struct Song *next;
 } Song;
@@ -62,6 +70,26 @@ typedef enum { PL_SORT_TITLE, PL_SORT_ARTIST, PL_SORT_DURATION } PlSortKey;
 /* Human readable text for a PlResult (for error messages). */
 const char *pl_strerror(PlResult r);
 
+/*
+ * Everything needed to create a song.  NULL / "" fields mean "not set".
+ * source may be NULL: it is then "spotify" when spotify_uri is given and
+ * "local" otherwise.  Rules enforced when a song is created:
+ *   spotify: spotify_uri must look like spotify:track:<22 chars>; no audio_url;
+ *            duplicates are detected by spotify_uri
+ *   local:   no spotify_uri; audio_url (optional) must be /music/<name>;
+ *            duplicates are detected by title (case-insensitive)
+ *   image_url (optional) must start with https://
+ */
+typedef struct {
+    const char *title;
+    const char *artist;
+    int         duration;       /* seconds */
+    const char *spotify_uri;
+    const char *image_url;
+    const char *source;
+    const char *audio_url;
+} SongInfo;
+
 /* Lifecycle ---------------------------------------------------------- */
 void pl_init(Playlist *pl);
 void pl_free(Playlist *pl);                 /* frees every node, O(n)   */
@@ -75,6 +103,12 @@ PlResult pl_insert_at(Playlist *pl, int pos, const char *title,
                       const char *artist, int duration,
                       int *out_id);                             /* O(n) */
 
+/* Same three insertions with the full set of song fields. */
+PlResult pl_add_end_info  (Playlist *pl, const SongInfo *info, int *out_id);
+PlResult pl_add_start_info(Playlist *pl, const SongInfo *info, int *out_id);
+PlResult pl_insert_at_info(Playlist *pl, int pos, const SongInfo *info,
+                           int *out_id);
+
 /* Deletion ----------------------------------------------------------- */
 PlResult pl_delete_by_id   (Playlist *pl, int id);              /* O(n) */
 PlResult pl_delete_by_title(Playlist *pl, const char *title);   /* O(n) */
@@ -82,6 +116,7 @@ PlResult pl_delete_by_title(Playlist *pl, const char *title);   /* O(n) */
 /* Lookup / traversal ------------------------------------------------- */
 Song *pl_find_by_id   (const Playlist *pl, int id);             /* O(n) */
 Song *pl_find_by_title(const Playlist *pl, const char *title);  /* O(n) */
+Song *pl_find_by_uri  (const Playlist *pl, const char *uri);    /* O(n) */
 int   pl_total_duration(const Playlist *pl);                    /* O(n) */
 
 /* Calls cb(song, ctx) for every song whose title or artist contains q
@@ -100,7 +135,9 @@ void pl_reverse(Playlist *pl);                                  /* O(n) */
 void pl_sort   (Playlist *pl, PlSortKey key);              /* O(n log n) */
 PlResult pl_shuffle(Playlist *pl);                              /* O(n) */
 
-/* Persistence: one line per song:  title|artist|duration ------------- */
+/* Persistence: one tab-separated line per song:
+ *   source TAB title TAB artist TAB duration TAB uri TAB image TAB audio
+ * (old "title|artist|duration" lines are still understood on load) ----- */
 PlResult pl_save(const Playlist *pl, const char *path);
 PlResult pl_load(Playlist *pl, const char *path);  /* replaces contents */
 

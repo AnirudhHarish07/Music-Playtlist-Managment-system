@@ -5,8 +5,13 @@
  * only translates HTTP requests into list operations and list contents
  * into JSON.  Static files (the web UI) are served from the frontend dir.
  *
- * Usage:  server [frontend_dir] [data_file]
- *         defaults: ../frontend  ../data/playlist.txt   (run from backend/)
+ * Spotify login/search/playback all happen in the browser (frontend/spotify.js);
+ * this server never sees a token or secret.  It only stores song metadata
+ * (including the spotify_uri to play) in the linked list, decides which song
+ * comes next/previous, and serves local MP3s from the music/ folder.
+ *
+ * Usage:  server [frontend_dir] [data_file] [music_dir]
+ *         defaults: ../frontend  ../data/playlist.txt  ../music   (run from backend/)
  */
 #ifndef _WIN32
 #define _XOPEN_SOURCE 700   /* realpath() */
@@ -28,7 +33,10 @@ static Playlist g_pl;                       /* the one and only playlist */
 static const char *g_frontend = "../frontend";
 static const char *g_datafile = "../data/playlist.txt";
 static volatile int g_running = 1;
+static const char *g_music = "../music";
 static char g_frontend_abs[4096];
+static char g_music_abs[4096];
+static char g_root_spec[8300];              /* Mongoose root_dir: "/=frontend,/music=music" */
 
 static const char *CORS_JSON =
     "Content-Type: application/json\r\n"
@@ -93,7 +101,15 @@ static void song_json(Buf *b, const Song *s, int position)
     buf_json_str(b, s->title);
     buf_str(b, ",\"artist\":");
     buf_json_str(b, s->artist);
-    buf_fmt(b, ",\"duration\":%d}", s->duration);
+    buf_fmt(b, ",\"duration\":%d,\"source\":", s->duration);
+    buf_json_str(b, s->source);
+    buf_str(b, ",\"spotify_uri\":");
+    buf_json_str(b, s->spotify_uri);
+    buf_str(b, ",\"image_url\":");
+    buf_json_str(b, s->image_url);
+    buf_str(b, ",\"audio_url\":");
+    buf_json_str(b, s->audio_url);
+    buf_str(b, "}");
 }
 
 /* "songs":[...] in forward or backward order (reverse walks tail->prev). */
@@ -211,6 +227,19 @@ static int route(const struct mg_http_message *hm, const char *method,
            mg_match(hm->uri, mg_str(pattern), NULL);
 }
 
+/* Does the (not NUL-terminated) string end with ".mp3", any case? */
+static int has_mp3_suffix(struct mg_str s)
+{
+    static const char ext[] = ".mp3";
+    if (s.len < 5) return 0;
+    for (size_t i = 0; i < 4; i++) {
+        char ch = s.buf[s.len - 4 + i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        if (ch != ext[i]) return 0;
+    }
+    return 1;
+}
+
 /* Parse the trailing "/<digits>" of a URI; returns 1 and sets *id on success. */
 static int id_from_uri(const struct mg_str uri, const char *prefix, int *id)
 {
@@ -246,6 +275,11 @@ static void handle_add(struct mg_connection *c, struct mg_http_message *hm)
     char *title = mg_json_get_str(hm->body, "$.title");
     char *artist = mg_json_get_str(hm->body, "$.artist");
     char *at = mg_json_get_str(hm->body, "$.at");
+    char *uri = mg_json_get_str(hm->body, "$.spotify_uri");
+    char *image = mg_json_get_str(hm->body, "$.image_url");
+    char *source = mg_json_get_str(hm->body, "$.source");
+    char *audio = mg_json_get_str(hm->body, "$.audio_url");
+    SongInfo info;
     long duration = 0, minutes = 0, seconds = 0, position = 0;
     int has_dur = json_int(hm->body, "$.duration", &duration);
     int has_min = json_int(hm->body, "$.minutes", &minutes);
@@ -275,19 +309,27 @@ static void handle_add(struct mg_connection *c, struct mg_http_message *hm)
     } else {
         /* "position" without "at" implies at:"position" */
         const char *mode = at ? at : (has_pos == 1 ? "position" : "end");
+        info.title = title;
+        info.artist = artist;
+        info.duration = (int)duration;
+        info.spotify_uri = uri;
+        info.image_url = image;
+        info.source = source;
+        info.audio_url = audio;
         if (!strcmp(mode, "start"))
-            r = pl_add_start(&g_pl, title, artist, (int)duration, &new_id);
+            r = pl_add_start_info(&g_pl, &info, &new_id);
         else if (!strcmp(mode, "position")) {
             if (has_pos != 1) { reply_error(c, 400, "position is required when at is \"position\""); goto done; }
-            r = pl_insert_at(&g_pl, (int)position, title, artist, (int)duration, &new_id);
+            r = pl_insert_at_info(&g_pl, (int)position, &info, &new_id);
         } else
-            r = pl_add_end(&g_pl, title, artist, (int)duration, &new_id);
+            r = pl_add_end_info(&g_pl, &info, &new_id);
 
         if (r == PL_OK) reply_state(c, 201, "song added", pl_find_by_id(&g_pl, new_id));
         else            reply_pl_error(c, r);
     }
 done:
     free(title); free(artist); free(at);
+    free(uri); free(image); free(source); free(audio);
 }
 
 static void handle_delete(struct mg_connection *c, struct mg_http_message *hm)
@@ -364,6 +406,38 @@ static void handle_move(struct mg_connection *c, int forward)
     else            reply_pl_error(c, r);
 }
 
+/* ---- local MP3 files (music/ folder) ---- */
+
+static void local_file_cb(const char *name, void *ctx)
+{
+    Buf *b = ctx;
+    size_t n = strlen(name);
+    char enc[512];
+
+    if (n < 5 || n > 150 || b->oom) return;
+    if (mg_casecmp(name + n - 4, ".mp3") != 0) return;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)name[i] < 0x20) return;
+    if (mg_url_encode(name, n, enc, sizeof enc) == 0) return;
+
+    if (b->p[b->len - 1] != '[') buf_str(b, ",");
+    buf_str(b, "{\"name\":");
+    buf_json_str(b, name);
+    buf_str(b, ",\"url\":\"/music/");
+    buf_str(b, enc);
+    buf_str(b, "\"}");
+}
+
+/* GET /api/local-files: MP3s found in the music folder (scanned on every call). */
+static void handle_local_files(struct mg_connection *c)
+{
+    Buf b = {0};
+    buf_str(&b, "{\"files\":[");
+    if (g_music_abs[0]) mg_fs_posix.ls(g_music_abs, local_file_cb, &b);
+    buf_str(&b, "]}");
+    reply_buf(c, 200, &b);
+}
+
 static void handle_sort(struct mg_connection *c, struct mg_http_message *hm)
 {
     char *by = mg_json_get_str(hm->body, "$.by");
@@ -432,12 +506,24 @@ static void on_event(struct mg_connection *c, int ev, void *ev_data)
         if (r == PL_OK) reply_state(c, 200, "playlist loaded", NULL);
         else if (r == PL_ERR_IO) reply_error(c, 404, "data file not found");
         else reply_pl_error(c, r);
+    } else if (route(hm, "GET", "/api/local-files")) {
+        handle_local_files(c);
     } else if (mg_match(hm->uri, mg_str("/api/*"), NULL)) {
         reply_error(c, 404, "unknown API endpoint or method");
+    } else if (hm->uri.len >= 7 && memcmp(hm->uri.buf, "/music/", 7) == 0 &&
+               !has_mp3_suffix(hm->uri)) {
+        reply_error(c, 404, "only .mp3 files are served from /music/");
+    } else if (route(hm, "GET", "/callback")) {
+        /* Spotify redirects here after login; the page's JavaScript finishes the PKCE exchange. */
+        struct mg_http_serve_opts opts;
+        char page[sizeof g_frontend_abs + 16];
+        memset(&opts, 0, sizeof opts);
+        snprintf(page, sizeof page, "%s/index.html", g_frontend_abs);
+        mg_http_serve_file(c, hm, page, &opts);
     } else {
         struct mg_http_serve_opts opts;
         memset(&opts, 0, sizeof opts);
-        opts.root_dir = g_frontend_abs;
+        opts.root_dir = g_root_spec;        /* "/" -> frontend, "/music" -> MP3 folder */
         mg_http_serve_dir(c, hm, &opts);
     }
 }
@@ -467,12 +553,24 @@ int main(int argc, char **argv)
 
     if (argc > 1) g_frontend = argv[1];
     if (argc > 2) g_datafile = argv[2];
+    if (argc > 3) g_music = argv[3];
 
     if (!resolve_dir(g_frontend, g_frontend_abs, sizeof g_frontend_abs)) {
         fprintf(stderr, "Frontend folder not found: %s\n"
-                        "Run from the backend/ folder or pass the path: server <frontend_dir> <data_file>\n",
+                        "Run from the backend/ folder or pass the path: server <frontend_dir> <data_file> <music_dir>\n",
                 g_frontend);
         return 1;
+    }
+
+    /* The music folder is optional: without it only Spotify songs can play. */
+    if (resolve_dir(g_music, g_music_abs, sizeof g_music_abs) &&
+        (mg_fs_posix.st(g_music_abs, NULL, NULL) & MG_FS_DIR)) {
+        snprintf(g_root_spec, sizeof g_root_spec, "/=%s,/music=%s", g_frontend_abs, g_music_abs);
+        printf("Serving local MP3s from %s at /music/\n", g_music_abs);
+    } else {
+        g_music_abs[0] = '\0';
+        snprintf(g_root_spec, sizeof g_root_spec, "/=%s", g_frontend_abs);
+        printf("No music folder at %s (local MP3 playback disabled)\n", g_music);
     }
 
     srand((unsigned)time(NULL));

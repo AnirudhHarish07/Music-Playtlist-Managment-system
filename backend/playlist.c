@@ -22,8 +22,8 @@ const char *pl_strerror(PlResult r)
 {
     switch (r) {
     case PL_OK:           return "ok";
-    case PL_ERR_INVALID:  return "invalid input";
-    case PL_ERR_DUPLICATE:return "a song with that title already exists";
+    case PL_ERR_INVALID:  return "invalid input (check title, artist, duration, Spotify URI, image URL and audio URL)";
+    case PL_ERR_DUPLICATE:return "that song is already in the playlist";
     case PL_ERR_RANGE:    return "position out of range";
     case PL_ERR_NOT_FOUND:return "song not found";
     case PL_ERR_EMPTY:    return "playlist is empty";
@@ -63,7 +63,7 @@ static int ci_contains(const char *hay, const char *needle)
 /*
  * Copy src into dst (size cap), trimming surrounding whitespace.
  * Fails when the text is empty, too long, or contains control characters
- * or '|' (the separator of the save file format).
+ * (which includes the TAB used as separator in the save file).
  */
 static int clean_text(char *dst, size_t cap, const char *src)
 {
@@ -74,9 +74,39 @@ static int clean_text(char *dst, size_t cap, const char *src)
     while (len > 0 && isspace((unsigned char)src[len - 1])) len--;
     if (len == 0 || len >= cap) return 0;
     for (size_t i = 0; i < len; i++)
-        if (iscntrl((unsigned char)src[i]) || src[i] == '|') return 0;
+        if (iscntrl((unsigned char)src[i])) return 0;
     memcpy(dst, src, len);
     dst[len] = '\0';
+    return 1;
+}
+
+/* Optional text field: "" or NULL is fine, otherwise must fit and have no control chars. */
+static int clean_optional(char *dst, size_t cap, const char *src)
+{
+    size_t len;
+    dst[0] = '\0';
+    if (!src || !*src) return 1;
+    len = strlen(src);
+    if (len >= cap) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (iscntrl((unsigned char)src[i]) || src[i] == ' ') return 0;
+    memcpy(dst, src, len + 1);
+    return 1;
+}
+
+static int starts_with(const char *s, const char *prefix)
+{
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+/* "spotify:track:" followed by exactly 22 base-62 characters. */
+static int valid_spotify_uri(const char *u)
+{
+    if (!starts_with(u, "spotify:track:")) return 0;
+    u += strlen("spotify:track:");
+    if (strlen(u) != 22) return 0;
+    for (; *u; u++)
+        if (!isalnum((unsigned char)*u)) return 0;
     return 1;
 }
 
@@ -85,25 +115,61 @@ static int clean_text(char *dst, size_t cap, const char *src)
  * The node gets prev = next = NULL; the caller links it into the list.
  * The id counter is only advanced by the caller after linking succeeds.
  */
-static PlResult make_song(Playlist *pl, const char *title, const char *artist,
-                          int duration, Song **out)
+static PlResult make_song(Playlist *pl, const SongInfo *in, Song **out)
 {
     Song *s;
     char t[PL_TITLE_MAX], a[PL_ARTIST_MAX];
+    char uri[PL_URI_MAX], img[PL_IMAGE_MAX], audio[PL_AUDIO_MAX], src[PL_SOURCE_MAX];
+    int is_spotify;
 
-    if (!clean_text(t, sizeof t, title) || !clean_text(a, sizeof a, artist))
+    if (!in) return PL_ERR_INVALID;
+    if (!clean_text(t, sizeof t, in->title) || !clean_text(a, sizeof a, in->artist))
         return PL_ERR_INVALID;
-    if (duration < 1 || duration > PL_MAX_DURATION)
+    if (in->duration < 1 || in->duration > PL_MAX_DURATION)
         return PL_ERR_INVALID;
-    if (pl_find_by_title(pl, t) != NULL)
-        return PL_ERR_DUPLICATE;
+    if (!clean_optional(uri, sizeof uri, in->spotify_uri) ||
+        !clean_optional(img, sizeof img, in->image_url) ||
+        !clean_optional(audio, sizeof audio, in->audio_url))
+        return PL_ERR_INVALID;
+
+    /* source: explicit, or inferred from whether a Spotify URI was given */
+    if (in->source && *in->source) {
+        if (strlen(in->source) >= sizeof src) return PL_ERR_INVALID;
+        strcpy(src, in->source);
+    } else {
+        strcpy(src, uri[0] ? "spotify" : "local");
+    }
+    if (strcmp(src, "spotify") && strcmp(src, "local")) return PL_ERR_INVALID;
+    is_spotify = !strcmp(src, "spotify");
+
+    if (is_spotify) {
+        if (!valid_spotify_uri(uri) || audio[0]) return PL_ERR_INVALID;
+    } else {
+        if (uri[0]) return PL_ERR_INVALID;
+        if (audio[0] && (!starts_with(audio, "/music/") || strstr(audio, "..")))
+            return PL_ERR_INVALID;
+    }
+    if (img[0] && !starts_with(img, "https://")) return PL_ERR_INVALID;
+
+    /* duplicates: Spotify songs by URI, local songs by title */
+    if (is_spotify) {
+        if (pl_find_by_uri(pl, uri) != NULL) return PL_ERR_DUPLICATE;
+    } else {
+        for (const Song *d = pl->head; d; d = d->next)
+            if (!strcmp(d->source, "local") && ci_cmp(d->title, t) == 0)
+                return PL_ERR_DUPLICATE;
+    }
 
     s = malloc(sizeof *s);
     if (!s) return PL_ERR_NOMEM;
     s->id = pl->nextId;
     strcpy(s->title, t);
     strcpy(s->artist, a);
-    s->duration = duration;
+    s->duration = in->duration;
+    strcpy(s->spotify_uri, uri);
+    strcpy(s->image_url, img);
+    strcpy(s->source, src);
+    strcpy(s->audio_url, audio);
     s->prev = s->next = NULL;
     *out = s;
     return PL_OK;
@@ -159,11 +225,10 @@ void pl_free(Playlist *pl)
  *   tail       = new
  * Empty list: head and tail both become new.
  */
-PlResult pl_add_end(Playlist *pl, const char *title, const char *artist,
-                    int duration, int *out_id)
+PlResult pl_add_end_info(Playlist *pl, const SongInfo *info, int *out_id)
 {
     Song *s;
-    PlResult r = make_song(pl, title, artist, duration, &s);
+    PlResult r = make_song(pl, info, &s);
     if (r != PL_OK) return r;
 
     if (pl->tail) {
@@ -188,11 +253,10 @@ PlResult pl_add_end(Playlist *pl, const char *title, const char *artist,
  *   old head->prev = new
  *   head      = new
  */
-PlResult pl_add_start(Playlist *pl, const char *title, const char *artist,
-                      int duration, int *out_id)
+PlResult pl_add_start_info(Playlist *pl, const SongInfo *info, int *out_id)
 {
     Song *s;
-    PlResult r = make_song(pl, title, artist, duration, &s);
+    PlResult r = make_song(pl, info, &s);
     if (r != PL_OK) return r;
 
     if (pl->head) {
@@ -222,17 +286,17 @@ PlResult pl_add_start(Playlist *pl, const char *title, const char *artist,
  *   3. p->next   = new
  *   4. at->prev  = new
  */
-PlResult pl_insert_at(Playlist *pl, int pos, const char *title,
-                      const char *artist, int duration, int *out_id)
+PlResult pl_insert_at_info(Playlist *pl, int pos, const SongInfo *info,
+                           int *out_id)
 {
     Song *s, *at;
     PlResult r;
 
     if (pos < 1 || pos > pl->count + 1) return PL_ERR_RANGE;
-    if (pos == 1)             return pl_add_start(pl, title, artist, duration, out_id);
-    if (pos == pl->count + 1) return pl_add_end  (pl, title, artist, duration, out_id);
+    if (pos == 1)             return pl_add_start_info(pl, info, out_id);
+    if (pos == pl->count + 1) return pl_add_end_info  (pl, info, out_id);
 
-    r = make_song(pl, title, artist, duration, &s);
+    r = make_song(pl, info, &s);
     if (r != PL_OK) return r;
 
     at = pl->head;                          /* walk to the node at `pos` */
@@ -245,6 +309,38 @@ PlResult pl_insert_at(Playlist *pl, int pos, const char *title,
 
     after_link(pl, s, out_id);
     return PL_OK;
+}
+
+
+/* ---- convenience wrappers: a plain local song without audio file ---- */
+
+static SongInfo local_info(const char *title, const char *artist, int duration)
+{
+    SongInfo i;
+    memset(&i, 0, sizeof i);
+    i.title = title; i.artist = artist; i.duration = duration;
+    return i;
+}
+
+PlResult pl_add_end(Playlist *pl, const char *title, const char *artist,
+                    int duration, int *out_id)
+{
+    SongInfo i = local_info(title, artist, duration);
+    return pl_add_end_info(pl, &i, out_id);
+}
+
+PlResult pl_add_start(Playlist *pl, const char *title, const char *artist,
+                      int duration, int *out_id)
+{
+    SongInfo i = local_info(title, artist, duration);
+    return pl_add_start_info(pl, &i, out_id);
+}
+
+PlResult pl_insert_at(Playlist *pl, int pos, const char *title,
+                      const char *artist, int duration, int *out_id)
+{
+    SongInfo i = local_info(title, artist, duration);
+    return pl_insert_at_info(pl, pos, &i, out_id);
 }
 
 /* ====================================================================
@@ -262,6 +358,14 @@ Song *pl_find_by_title(const Playlist *pl, const char *title)
 {
     for (Song *s = pl->head; s; s = s->next)
         if (ci_cmp(s->title, title) == 0) return s;
+    return NULL;
+}
+
+Song *pl_find_by_uri(const Playlist *pl, const char *uri)
+{
+    if (!uri || !*uri) return NULL;
+    for (Song *s = pl->head; s; s = s->next)
+        if (s->spotify_uri[0] && strcmp(s->spotify_uri, uri) == 0) return s;
     return NULL;
 }
 
@@ -504,26 +608,83 @@ PlResult pl_save(const Playlist *pl, const char *path)
     FILE *f = fopen(path, "w");
     if (!f) return PL_ERR_IO;
     for (const Song *s = pl->head; s; s = s->next)
-        fprintf(f, "%s|%s|%d\n", s->title, s->artist, s->duration);
+        fprintf(f, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", s->source, s->title,
+                s->artist, s->duration, s->spotify_uri, s->image_url,
+                s->audio_url);
     return fclose(f) == 0 ? PL_OK : PL_ERR_IO;
+}
+
+/* Parse "123" fully; returns -1 when it is not a plain positive number. */
+static long parse_duration(const char *s)
+{
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 1 || v > PL_MAX_DURATION) return -1;
+    return v;
+}
+
+/*
+ * Turn one line of the save file into a SongInfo (pointers into `line`,
+ * which is modified).  Returns 0 for a malformed line.
+ *   new format: source TAB title TAB artist TAB duration TAB uri TAB image TAB audio
+ *   old format: title|artist|duration       (loaded as a local song)
+ */
+static int parse_line(char *line, SongInfo *info)
+{
+    char *field[7];
+    int n = 0;
+    long dur;
+
+    memset(info, 0, sizeof *info);
+    if (strchr(line, '\t')) {
+        char *p = line;
+        while (n < 7) {                         /* split on TAB, keep empty fields */
+            field[n++] = p;
+            p = strchr(p, '\t');
+            if (!p) break;
+            *p++ = '\0';
+        }
+        if (n != 7) return 0;
+        dur = parse_duration(field[3]);
+        if (dur < 0) return 0;
+        info->source = field[0];
+        info->title = field[1];
+        info->artist = field[2];
+        info->duration = (int)dur;
+        info->spotify_uri = field[4];
+        info->image_url = field[5];
+        info->audio_url = field[6];
+        return 1;
+    } else {
+        char *sep1 = strchr(line, '|');
+        char *sep2 = sep1 ? strchr(sep1 + 1, '|') : NULL;
+        if (!sep1 || !sep2) return 0;
+        *sep1 = *sep2 = '\0';
+        dur = parse_duration(sep2 + 1);
+        if (dur < 0) return 0;
+        info->title = line;
+        info->artist = sep1 + 1;
+        info->duration = (int)dur;
+        return 1;
+    }
 }
 
 /*
  * Load into a temporary playlist first; only when the whole file has been
  * read is the old content freed and replaced.  Malformed lines and
- * duplicate titles are skipped.  Ids are reassigned, repeat is kept.
+ * duplicates are skipped.  Ids are reassigned, repeat is kept.
  */
 PlResult pl_load(Playlist *pl, const char *path)
 {
     Playlist tmp;
-    char line[2 * PL_TITLE_MAX + 64];
+    char line[PL_TITLE_MAX + PL_ARTIST_MAX + PL_URI_MAX + PL_IMAGE_MAX +
+              PL_AUDIO_MAX + 128];
     FILE *f = fopen(path, "r");
     if (!f) return PL_ERR_IO;
 
     pl_init(&tmp);
     while (fgets(line, sizeof line, f)) {
-        char *sep1, *sep2, *end;
-        long dur;
+        SongInfo info;
         size_t len = strlen(line);
 
         if (len > 0 && line[len - 1] != '\n' && !feof(f)) {
@@ -534,17 +695,9 @@ PlResult pl_load(Playlist *pl, const char *path)
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
         if (len == 0 || line[0] == '#') continue;
+        if (!parse_line(line, &info)) continue;
 
-        sep1 = strchr(line, '|');
-        sep2 = sep1 ? strchr(sep1 + 1, '|') : NULL;
-        if (!sep1 || !sep2) continue;
-        *sep1 = '\0';
-        *sep2 = '\0';
-        dur = strtol(sep2 + 1, &end, 10);
-        if (*end != '\0' || end == sep2 + 1) continue;
-        if (dur < 1 || dur > PL_MAX_DURATION) continue;
-
-        if (pl_add_end(&tmp, line, sep1 + 1, (int)dur, NULL) == PL_ERR_NOMEM) {
+        if (pl_add_end_info(&tmp, &info, NULL) == PL_ERR_NOMEM) {
             pl_free(&tmp);
             fclose(f);
             return PL_ERR_NOMEM;
