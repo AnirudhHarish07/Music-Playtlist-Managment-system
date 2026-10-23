@@ -1,0 +1,5 @@
+*.o
+backend/server
+backend/server.exe
+backend/test_playlist
+backend/test_playlist.exe
