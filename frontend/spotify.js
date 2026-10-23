@@ -91,12 +91,17 @@
         sessionStorage.setItem('sp_verifier', verifier);
         sessionStorage.setItem('sp_state', state);
       } catch (e) { throw SpotifyError('api', 'Browser storage is blocked; cannot log in.'); }
-      var q = new URLSearchParams({
+      var params = {
         client_id: cfg.clientId, response_type: 'code', redirect_uri: REDIRECT_URI,
         code_challenge_method: 'S256', code_challenge: base64url(hash),
         scope: SCOPES, state: state
-      });
-      window.location.assign(AUTH_URL + '?' + q.toString());
+      };
+      // encodeURIComponent writes spaces as %20; URLSearchParams would write "+",
+      // which Spotify rejects in the scope list (error "invalid_scope").
+      var query = Object.keys(params).map(function (k) {
+        return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+      }).join('&');
+      window.location.assign(AUTH_URL + '?' + query);
     });
   }
 
