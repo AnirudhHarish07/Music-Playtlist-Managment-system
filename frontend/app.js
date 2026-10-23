@@ -135,8 +135,17 @@
 
   // Both players call this when the song finishes: ask the C list for the next one.
   function onTrackEnded() {
+    if (engine.endFired) return;                   // the SDK event and the timer below may both report the end
+    engine.endFired = true;
     engine.playing = false;
     advance('/api/player/next', true);
+  }
+
+  // Safety net for Spotify: if the clock runs well past the track length and no
+  // "ended" state arrived from the SDK, treat the track as finished.
+  function checkSpotifyEnd() {
+    if (engine.kind === 'spotify' && engine.playing && !engine.endFired &&
+        engine.dur > 0 && enginePos() >= engine.dur + 1.5) onTrackEnded();
   }
 
   // Start playing a song object (the one the C backend says is current).
@@ -310,6 +319,7 @@
     $('art').classList.toggle('spinning', active && engine.playing);
     $('np-length').textContent = fmt(dur);
     $('btn-repeat').setAttribute('aria-pressed', state.repeat ? 'true' : 'false');
+    $('btn-repeat').textContent = '\u21bb Repeat: ' + (state.repeat ? 'On' : 'Off');
     $('btn-play').innerHTML = active && engine.playing ? '&#9208;' : '&#9654;';
 
     var seek = $('seek');
@@ -348,7 +358,7 @@
     if (searchQuery) runFilter();
   }
 
-  setInterval(renderTransport, 250);
+  setInterval(function () { renderTransport(); checkSpotifyEnd(); }, 250);
 
   /* ---------- playlist actions ---------- */
 

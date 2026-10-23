@@ -502,10 +502,24 @@ static void on_event(struct mg_connection *c, int ev, void *ev_data)
         if (r == PL_OK) reply_state(c, 200, "playlist saved", NULL);
         else            reply_error(c, 500, "could not write the data file");
     } else if (route(hm, "POST", "/api/playlist/load")) {
-        PlResult r = pl_load(&g_pl, g_datafile);
-        if (r == PL_OK) reply_state(c, 200, "playlist loaded", NULL);
-        else if (r == PL_ERR_IO) reply_error(c, 404, "data file not found");
-        else reply_pl_error(c, r);
+        /* Load into a temporary list first so an empty/missing file never wipes the current playlist. */
+        Playlist tmp;
+        PlResult r;
+        pl_init(&tmp);
+        tmp.repeat = g_pl.repeat;
+        r = pl_load(&tmp, g_datafile);
+        if (r == PL_ERR_IO) {
+            reply_error(c, 404, "no saved playlist yet - press Save first");
+        } else if (r != PL_OK) {
+            reply_pl_error(c, r);
+        } else if (tmp.count == 0) {
+            pl_free(&tmp);
+            reply_error(c, 400, "the saved playlist is empty - press Save first (your current playlist was kept)");
+        } else {
+            pl_free(&g_pl);
+            g_pl = tmp;
+            reply_state(c, 200, "playlist loaded", NULL);
+        }
     } else if (route(hm, "GET", "/api/local-files")) {
         handle_local_files(c);
     } else if (mg_match(hm->uri, mg_str("/api/*"), NULL)) {
