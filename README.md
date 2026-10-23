@@ -28,6 +28,7 @@ music-playlist/
     index.html  style.css
     app.js                    playlist UI, player engine, talks to the C API
     spotify.js                Spotify login (PKCE), search, Web Playback SDK
+    fx.js                     visual effects only: floating music notes, animated cursor
     config.example.js         copy to config.js and paste your Client ID (config.js is git-ignored)
   music/                      your own .mp3 files (git-ignored), served at /music/<file>.mp3
   data/playlist.txt           saved playlist, loaded when the server starts
@@ -194,6 +195,10 @@ Plain HTML/CSS/JS served by the C server, no build step.
   then play the song it returns: Spotify songs via `PUT /v1/me/player/play?device_id=...` with `{"uris":[spotify_uri]}`
   on the Web Playback SDK device, local songs through `<audio>`. Spotify's own next/previous/queue endpoints are never
   called. With repeat on, the list wraps around; with repeat off, playback stops after the last song.
+* **Look and feel**: frosted-glass panels over a glowing gradient, drifting music notes in the background, a glowing
+  cursor with a trailing ring that grows over buttons, a short trail of notes and a burst on click, an equalizer on the
+  playing row, glowing album art while playing, filled seek/volume sliders. Effects are in `fx.js` / `style.css` only.
+  They switch off for "reduce motion" and the cursor effects are skipped on touch screens.
 * **Errors** are shown as toasts (and a banner for login problems): not logged in, expired session, non-Premium
   account, browser without DRM (use Chrome/Edge), network failure, rate limit (429, with the wait time), and Dashboard
   user-list problems (403). Titles are inserted with `textContent`, so HTML in a title never executes.

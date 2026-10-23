@@ -251,6 +251,12 @@
       var wrap = document.createElement('div');
       wrap.className = 'title-wrap';
       wrap.appendChild(thumb(s.image_url, 'thumb'));
+      if (s.id === state.currentId) {                 // animated equalizer on the current row
+        var eq = document.createElement('span');
+        eq.className = 'eq';
+        eq.innerHTML = '<i></i><i></i><i></i>';
+        wrap.appendChild(eq);
+      }
       var txt = document.createElement('span');
       txt.className = 'title-text';
       txt.textContent = s.title;
@@ -317,6 +323,7 @@
       $('art-ph').hidden = false;
     }
     $('art').classList.toggle('spinning', active && engine.playing);
+    document.body.classList.toggle('is-playing', !!(active && engine.playing));
     $('np-length').textContent = fmt(dur);
     $('btn-repeat').setAttribute('aria-pressed', state.repeat ? 'true' : 'false');
     $('btn-repeat').textContent = '\u21bb Repeat: ' + (state.repeat ? 'On' : 'Off');
@@ -327,8 +334,15 @@
     seek.max = Math.max(1, Math.round(dur));
     if (!seeking) {
       seek.value = Math.round(pos);
+    fillSlider(seek);
       $('np-elapsed').textContent = fmt(pos);
     }
+  }
+
+  // paint the filled part of a range slider (CSS reads --pct)
+  function fillSlider(el) {
+    var max = parseFloat(el.max) || 1;
+    el.style.setProperty('--pct', Math.min(100, Math.max(0, parseFloat(el.value) / max * 100)) + '%');
   }
 
   function renderStats() {
@@ -399,6 +413,7 @@
 
   $('seek').addEventListener('input', function () {
     seeking = true;
+    fillSlider($('seek'));
     $('np-elapsed').textContent = fmt($('seek').value);
   });
   $('seek').addEventListener('change', function () {
@@ -415,7 +430,9 @@
 
   try { var saved = localStorage.getItem('volume'); if (saved !== null) $('volume').value = saved; } catch (e) { /* storage blocked */ }
   audio.volume = volume();
+  fillSlider($('volume'));
   $('volume').addEventListener('input', function () {
+    fillSlider($('volume'));
     audio.volume = volume();
     SP.setVolume(volume()).catch(function () {});
     try { localStorage.setItem('volume', $('volume').value); } catch (e) { /* ignore */ }
