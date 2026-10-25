@@ -1,1 +1,3 @@
-# Saved playlist (one tab-separated song per line). Written by the Save button.
+spotify	Night Changes	One Direction	227	spotify:track:5O2P9iiztwhomNh8xkR9lJ	https://i.scdn.co/image/ab67616d00001e0234a29f220057810cce98e1b4	
+spotify	Animals	Maroon 5	231	spotify:track:3h4T9Bg8OVSUYa6danHeH5	https://i.scdn.co/image/ab67616d00001e0237677af5b4f23fe9dc8a3c04	
+spotify	Drag Me Down	One Direction	192	spotify:track:2K87XMYnUMqLcX3zvtAF4G	https://i.scdn.co/image/ab67616d00001e024a075ca70ae4143a37eb4fbe	
