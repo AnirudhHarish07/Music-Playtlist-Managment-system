@@ -1,0 +1,3466 @@
+MUSIC PLAYLIST MANAGEMENT SYSTEM - SOURCE CODE
+
+See the .docx for the assembly steps. Layout: backend/ frontend/ data/ music/.
+Mongoose (backend/mongoose.c, mongoose.h) is third-party: download from
+https://raw.githubusercontent.com/cesanta/mongoose/7.14/mongoose.c and .../mongoose.h
+Create data/playlist.txt with one line:  # Saved playlist (one tab-separated song per line). Written by the Save button.
+
+==============================================================================
+1. backend/playlist.h
+Linked list module - structures and function declarations (the core data structure)
+==============================================================================
+/*
+ * playlist.h - Doubly linked list playlist (data structure module)
+ *
+ * This module knows nothing about HTTP or JSON.  It can be compiled and
+ * tested on its own (see test_playlist.c).
+ *
+ * Layout of the list (a -> b -> c):
+ *
+ *        head                          tail
+ *         |                             |
+ *         v                             v
+ *   NULL <- [a] <-> [b] <-> [c] -> NULL
+ *            prev/next pointers
+ *
+ *   - head->prev == NULL and tail->next == NULL
+ *   - every node n satisfies  n->next->prev == n  and  n->prev->next == n
+ *   - count always equals the number of nodes
+ */
+#ifndef PLAYLIST_H
+#define PLAYLIST_H
+
+#include <stddef.h>
+
+#define PL_TITLE_MAX  100
+#define PL_ARTIST_MAX 100
+#define PL_URI_MAX    100
+#define PL_IMAGE_MAX  300
+#define PL_SOURCE_MAX 10
+#define PL_AUDIO_MAX  300
+
+/* One song = one node of the doubly linked list. */
+typedef struct Song {
+    int  id;
+    char title[PL_TITLE_MAX];
+    char artist[PL_ARTIST_MAX];
+    int  duration;              /* seconds */
+    char spotify_uri[PL_URI_MAX];   /* "spotify:track:<id>" ("" for local)   */
+    char image_url[PL_IMAGE_MAX];   /* album art URL, may be ""              */
+    char source[PL_SOURCE_MAX];     /* "spotify" or "local"                  */
+    char audio_url[PL_AUDIO_MAX];   /* "/music/<file>.mp3" for local, or ""  */
+    struct Song *prev;
+    struct Song *next;
+} Song;
+
+/* The list header: everything needed to reach and manage the nodes. */
+typedef struct Playlist {
+    Song *head;                 /* first song, NULL when empty            */
+    Song *tail;                 /* last song,  NULL when empty            */
+    Song *current;              /* "now playing" song, NULL if none       */
+    int   count;                /* number of songs                        */
+    int   nextId;               /* id handed to the next created song     */
+    int   repeat;               /* 1 = wrap around at either end          */
+} Playlist;
+
+/* Result codes returned by the operations below. */
+typedef enum {
+    PL_OK = 0,
+    PL_ERR_INVALID,             /* bad title/artist/duration/argument     */
+    PL_ERR_DUPLICATE,           /* a song with that title already exists  */
+    PL_ERR_RANGE,               /* position outside 1..count+1            */
+    PL_ERR_NOT_FOUND,           /* no such song                           */
+    PL_ERR_EMPTY,               /* operation needs at least one song      */
+    PL_ERR_END,                 /* next/prev hit an end with repeat off   */
+    PL_ERR_NOMEM,               /* malloc failed                          */
+    PL_ERR_IO                   /* file could not be read/written         */
+} PlResult;
+
+typedef enum { PL_SORT_TITLE, PL_SORT_ARTIST, PL_SORT_DURATION } PlSortKey;
+
+/* Human readable text for a PlResult (for error messages). */
+const char *pl_strerror(PlResult r);
+
+/*
+ * Everything needed to create a song.  NULL / "" fields mean "not set".
+ * source may be NULL: it is then "spotify" when spotify_uri is given and
+ * "local" otherwise.  Rules enforced when a song is created:
+ *   spotify: spotify_uri must look like spotify:track:<22 chars>; no audio_url;
+ *            duplicates are detected by spotify_uri
+ *   local:   no spotify_uri; audio_url (optional) must be /music/<name>;
+ *            duplicates are detected by title (case-insensitive)
+ *   image_url (optional) must start with https://
+ */
+typedef struct {
+    const char *title;
+    const char *artist;
+    int         duration;       /* seconds */
+    const char *spotify_uri;
+    const char *image_url;
+    const char *source;
+    const char *audio_url;
+} SongInfo;
+
+/* Lifecycle ---------------------------------------------------------- */
+void pl_init(Playlist *pl);
+void pl_free(Playlist *pl);                 /* frees every node, O(n)   */
+
+/* Insertion  (new song id is written to *out_id when out_id != NULL) -- */
+PlResult pl_add_end  (Playlist *pl, const char *title, const char *artist,
+                      int duration, int *out_id);               /* O(1) */
+PlResult pl_add_start(Playlist *pl, const char *title, const char *artist,
+                      int duration, int *out_id);               /* O(1) */
+PlResult pl_insert_at(Playlist *pl, int pos, const char *title,
+                      const char *artist, int duration,
+                      int *out_id);                             /* O(n) */
+
+/* Same three insertions with the full set of song fields. */
+PlResult pl_add_end_info  (Playlist *pl, const SongInfo *info, int *out_id);
+PlResult pl_add_start_info(Playlist *pl, const SongInfo *info, int *out_id);
+PlResult pl_insert_at_info(Playlist *pl, int pos, const SongInfo *info,
+                           int *out_id);
+
+/* Deletion ----------------------------------------------------------- */
+PlResult pl_delete_by_id   (Playlist *pl, int id);              /* O(n) */
+PlResult pl_delete_by_title(Playlist *pl, const char *title);   /* O(n) */
+
+/* Lookup / traversal ------------------------------------------------- */
+Song *pl_find_by_id   (const Playlist *pl, int id);             /* O(n) */
+Song *pl_find_by_title(const Playlist *pl, const char *title);  /* O(n) */
+Song *pl_find_by_uri  (const Playlist *pl, const char *uri);    /* O(n) */
+int   pl_total_duration(const Playlist *pl);                    /* O(n) */
+
+/* Calls cb(song, ctx) for every song whose title or artist contains q
+ * (case-insensitive).  Returns the number of matches.            O(n*m) */
+typedef void (*PlVisitFn)(const Song *song, void *ctx);
+int pl_search(const Playlist *pl, const char *q, PlVisitFn cb, void *ctx);
+
+/* Player ------------------------------------------------------------- */
+PlResult pl_play_next(Playlist *pl);                            /* O(1) */
+PlResult pl_play_prev(Playlist *pl);                            /* O(1) */
+PlResult pl_play_id  (Playlist *pl, int id);                    /* O(n) */
+int      pl_toggle_repeat(Playlist *pl);    /* returns the new setting  */
+
+/* Reordering (nodes are relinked, never copied) ---------------------- */
+void pl_reverse(Playlist *pl);                                  /* O(n) */
+void pl_sort   (Playlist *pl, PlSortKey key);              /* O(n log n) */
+PlResult pl_shuffle(Playlist *pl);                              /* O(n) */
+
+/* Persistence: one tab-separated line per song:
+ *   source TAB title TAB artist TAB duration TAB uri TAB image TAB audio
+ * (old "title|artist|duration" lines are still understood on load) ----- */
+PlResult pl_save(const Playlist *pl, const char *path);
+PlResult pl_load(Playlist *pl, const char *path);  /* replaces contents */
+
+#endif /* PLAYLIST_H */
+
+==============================================================================
+2. backend/playlist.c
+Linked list module - all list operations: insert, delete, reverse, sort, shuffle, search, save/load
+==============================================================================
+/*
+ * playlist.c - all doubly linked list operations.
+ *
+ * Conventions used in the pointer diagrams below:
+ *     [x]  a node          <->  the prev/next pair between two nodes
+ *     NULL marks the end of the list on either side
+ */
+#include "playlist.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define PL_MAX_DURATION 35999   /* just under 10 hours, in seconds */
+
+/* ====================================================================
+ * Small helpers
+ * ==================================================================== */
+
+const char *pl_strerror(PlResult r)
+{
+    switch (r) {
+    case PL_OK:           return "ok";
+    case PL_ERR_INVALID:  return "invalid input (check title, artist, duration, Spotify URI, image URL and audio URL)";
+    case PL_ERR_DUPLICATE:return "that song is already in the playlist";
+    case PL_ERR_RANGE:    return "position out of range";
+    case PL_ERR_NOT_FOUND:return "song not found";
+    case PL_ERR_EMPTY:    return "playlist is empty";
+    case PL_ERR_END:      return "reached the end of the playlist (repeat is off)";
+    case PL_ERR_NOMEM:    return "out of memory";
+    case PL_ERR_IO:       return "file error";
+    }
+    return "unknown error";
+}
+
+/* Case-insensitive comparison (strcasecmp is not part of C99). */
+static int ci_cmp(const char *a, const char *b)
+{
+    while (*a && *b) {
+        int d = tolower((unsigned char)*a) - tolower((unsigned char)*b);
+        if (d != 0) return d;
+        a++; b++;
+    }
+    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
+}
+
+/* Case-insensitive "does hay contain needle?" (empty needle matches). */
+static int ci_contains(const char *hay, const char *needle)
+{
+    size_t n = strlen(needle);
+    if (n == 0) return 1;
+    for (; *hay; hay++) {
+        size_t i = 0;
+        while (i < n && hay[i] &&
+               tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i]))
+            i++;
+        if (i == n) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Copy src into dst (size cap), trimming surrounding whitespace.
+ * Fails when the text is empty, too long, or contains control characters
+ * (which includes the TAB used as separator in the save file).
+ */
+static int clean_text(char *dst, size_t cap, const char *src)
+{
+    size_t len;
+    if (!src) return 0;
+    while (isspace((unsigned char)*src)) src++;
+    len = strlen(src);
+    while (len > 0 && isspace((unsigned char)src[len - 1])) len--;
+    if (len == 0 || len >= cap) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (iscntrl((unsigned char)src[i])) return 0;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return 1;
+}
+
+/* Optional text field: "" or NULL is fine, otherwise must fit and have no control chars. */
+static int clean_optional(char *dst, size_t cap, const char *src)
+{
+    size_t len;
+    dst[0] = '\0';
+    if (!src || !*src) return 1;
+    len = strlen(src);
+    if (len >= cap) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (iscntrl((unsigned char)src[i]) || src[i] == ' ') return 0;
+    memcpy(dst, src, len + 1);
+    return 1;
+}
+
+static int starts_with(const char *s, const char *prefix)
+{
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+/* "spotify:track:" followed by exactly 22 base-62 characters. */
+static int valid_spotify_uri(const char *u)
+{
+    if (!starts_with(u, "spotify:track:")) return 0;
+    u += strlen("spotify:track:");
+    if (strlen(u) != 22) return 0;
+    for (; *u; u++)
+        if (!isalnum((unsigned char)*u)) return 0;
+    return 1;
+}
+
+/*
+ * Validate the input and allocate a fully initialised, UNLINKED node.
+ * The node gets prev = next = NULL; the caller links it into the list.
+ * The id counter is only advanced by the caller after linking succeeds.
+ */
+static PlResult make_song(Playlist *pl, const SongInfo *in, Song **out)
+{
+    Song *s;
+    char t[PL_TITLE_MAX], a[PL_ARTIST_MAX];
+    char uri[PL_URI_MAX], img[PL_IMAGE_MAX], audio[PL_AUDIO_MAX], src[PL_SOURCE_MAX];
+    int is_spotify;
+
+    if (!in) return PL_ERR_INVALID;
+    if (!clean_text(t, sizeof t, in->title) || !clean_text(a, sizeof a, in->artist))
+        return PL_ERR_INVALID;
+    if (in->duration < 1 || in->duration > PL_MAX_DURATION)
+        return PL_ERR_INVALID;
+    if (!clean_optional(uri, sizeof uri, in->spotify_uri) ||
+        !clean_optional(img, sizeof img, in->image_url) ||
+        !clean_optional(audio, sizeof audio, in->audio_url))
+        return PL_ERR_INVALID;
+
+    /* source: explicit, or inferred from whether a Spotify URI was given */
+    if (in->source && *in->source) {
+        if (strlen(in->source) >= sizeof src) return PL_ERR_INVALID;
+        strcpy(src, in->source);
+    } else {
+        strcpy(src, uri[0] ? "spotify" : "local");
+    }
+    if (strcmp(src, "spotify") && strcmp(src, "local")) return PL_ERR_INVALID;
+    is_spotify = !strcmp(src, "spotify");
+
+    if (is_spotify) {
+        if (!valid_spotify_uri(uri) || audio[0]) return PL_ERR_INVALID;
+    } else {
+        if (uri[0]) return PL_ERR_INVALID;
+        if (audio[0] && (!starts_with(audio, "/music/") || strstr(audio, "..")))
+            return PL_ERR_INVALID;
+    }
+    if (img[0] && !starts_with(img, "https://")) return PL_ERR_INVALID;
+
+    /* duplicates: Spotify songs by URI, local songs by title */
+    if (is_spotify) {
+        if (pl_find_by_uri(pl, uri) != NULL) return PL_ERR_DUPLICATE;
+    } else {
+        for (const Song *d = pl->head; d; d = d->next)
+            if (!strcmp(d->source, "local") && ci_cmp(d->title, t) == 0)
+                return PL_ERR_DUPLICATE;
+    }
+
+    s = malloc(sizeof *s);
+    if (!s) return PL_ERR_NOMEM;
+    s->id = pl->nextId;
+    strcpy(s->title, t);
+    strcpy(s->artist, a);
+    s->duration = in->duration;
+    strcpy(s->spotify_uri, uri);
+    strcpy(s->image_url, img);
+    strcpy(s->source, src);
+    strcpy(s->audio_url, audio);
+    s->prev = s->next = NULL;
+    *out = s;
+    return PL_OK;
+}
+
+/* Bookkeeping shared by every insertion once the node is linked. */
+static void after_link(Playlist *pl, Song *s, int *out_id)
+{
+    pl->nextId++;
+    pl->count++;
+    if (!pl->current) pl->current = s;      /* first song starts as "now playing" */
+    if (out_id) *out_id = s->id;
+}
+
+/* ====================================================================
+ * Lifecycle
+ * ==================================================================== */
+
+void pl_init(Playlist *pl)
+{
+    pl->head = pl->tail = pl->current = NULL;
+    pl->count  = 0;
+    pl->nextId = 1;
+    pl->repeat = 0;
+}
+
+/* Walk the list once, saving next BEFORE freeing the node. */
+void pl_free(Playlist *pl)
+{
+    Song *s = pl->head;
+    while (s) {
+        Song *next = s->next;
+        free(s);
+        s = next;
+    }
+    pl->head = pl->tail = pl->current = NULL;
+    pl->count = 0;
+}
+
+/* ====================================================================
+ * Insertion
+ * ==================================================================== */
+
+/*
+ * Add at the END (O(1) thanks to the tail pointer).
+ *
+ * Before:   head -> [a] <-> [b] <- tail
+ * After:    head -> [a] <-> [b] <-> [new] <- tail
+ *
+ * Pointer changes:
+ *   new->prev  = old tail
+ *   old tail->next = new
+ *   tail       = new
+ * Empty list: head and tail both become new.
+ */
+PlResult pl_add_end_info(Playlist *pl, const SongInfo *info, int *out_id)
+{
+    Song *s;
+    PlResult r = make_song(pl, info, &s);
+    if (r != PL_OK) return r;
+
+    if (pl->tail) {
+        s->prev = pl->tail;         /* new points back to the old last node */
+        pl->tail->next = s;         /* old last node points forward to new  */
+        pl->tail = s;               /* new is now the last node             */
+    } else {
+        pl->head = pl->tail = s;    /* first node: it is both ends          */
+    }
+    after_link(pl, s, out_id);
+    return PL_OK;
+}
+
+/*
+ * Add at the BEGINNING (O(1)).
+ *
+ * Before:   head -> [a] <-> [b] <- tail
+ * After:    head -> [new] <-> [a] <-> [b] <- tail
+ *
+ * Pointer changes:
+ *   new->next = old head
+ *   old head->prev = new
+ *   head      = new
+ */
+PlResult pl_add_start_info(Playlist *pl, const SongInfo *info, int *out_id)
+{
+    Song *s;
+    PlResult r = make_song(pl, info, &s);
+    if (r != PL_OK) return r;
+
+    if (pl->head) {
+        s->next = pl->head;         /* new points forward to the old first  */
+        pl->head->prev = s;         /* old first points back to new         */
+        pl->head = s;
+    } else {
+        pl->head = pl->tail = s;
+    }
+    after_link(pl, s, out_id);
+    return PL_OK;
+}
+
+/*
+ * Insert so that the new song ends up at 1-based position `pos`.
+ * Valid range is 1 .. count+1 (count+1 means "append").  O(n) to walk.
+ *
+ * General case (1 < pos <= count): `at` is the node currently at pos.
+ *
+ * Before:   [p] <-> [at]            where p = at->prev
+ * After:    [p] <-> [new] <-> [at]
+ *
+ * Four pointers change (order matters, set new's pointers first so we
+ * never lose the neighbours):
+ *   1. new->prev = p
+ *   2. new->next = at
+ *   3. p->next   = new
+ *   4. at->prev  = new
+ */
+PlResult pl_insert_at_info(Playlist *pl, int pos, const SongInfo *info,
+                           int *out_id)
+{
+    Song *s, *at;
+    PlResult r;
+
+    if (pos < 1 || pos > pl->count + 1) return PL_ERR_RANGE;
+    if (pos == 1)             return pl_add_start_info(pl, info, out_id);
+    if (pos == pl->count + 1) return pl_add_end_info  (pl, info, out_id);
+
+    r = make_song(pl, info, &s);
+    if (r != PL_OK) return r;
+
+    at = pl->head;                          /* walk to the node at `pos` */
+    for (int i = 1; i < pos; i++) at = at->next;
+
+    s->prev = at->prev;                     /* 1 */
+    s->next = at;                           /* 2 */
+    at->prev->next = s;                     /* 3 (at->prev exists: pos > 1) */
+    at->prev = s;                           /* 4 */
+
+    after_link(pl, s, out_id);
+    return PL_OK;
+}
+
+
+/* ---- convenience wrappers: a plain local song without audio file ---- */
+
+static SongInfo local_info(const char *title, const char *artist, int duration)
+{
+    SongInfo i;
+    memset(&i, 0, sizeof i);
+    i.title = title; i.artist = artist; i.duration = duration;
+    return i;
+}
+
+PlResult pl_add_end(Playlist *pl, const char *title, const char *artist,
+                    int duration, int *out_id)
+{
+    SongInfo i = local_info(title, artist, duration);
+    return pl_add_end_info(pl, &i, out_id);
+}
+
+PlResult pl_add_start(Playlist *pl, const char *title, const char *artist,
+                      int duration, int *out_id)
+{
+    SongInfo i = local_info(title, artist, duration);
+    return pl_add_start_info(pl, &i, out_id);
+}
+
+PlResult pl_insert_at(Playlist *pl, int pos, const char *title,
+                      const char *artist, int duration, int *out_id)
+{
+    SongInfo i = local_info(title, artist, duration);
+    return pl_insert_at_info(pl, pos, &i, out_id);
+}
+
+/* ====================================================================
+ * Lookup
+ * ==================================================================== */
+
+Song *pl_find_by_id(const Playlist *pl, int id)
+{
+    for (Song *s = pl->head; s; s = s->next)
+        if (s->id == id) return s;
+    return NULL;
+}
+
+Song *pl_find_by_title(const Playlist *pl, const char *title)
+{
+    for (Song *s = pl->head; s; s = s->next)
+        if (ci_cmp(s->title, title) == 0) return s;
+    return NULL;
+}
+
+Song *pl_find_by_uri(const Playlist *pl, const char *uri)
+{
+    if (!uri || !*uri) return NULL;
+    for (Song *s = pl->head; s; s = s->next)
+        if (s->spotify_uri[0] && strcmp(s->spotify_uri, uri) == 0) return s;
+    return NULL;
+}
+
+int pl_total_duration(const Playlist *pl)
+{
+    int total = 0;
+    for (const Song *s = pl->head; s; s = s->next) total += s->duration;
+    return total;
+}
+
+int pl_search(const Playlist *pl, const char *q, PlVisitFn cb, void *ctx)
+{
+    int n = 0;
+    for (const Song *s = pl->head; s; s = s->next) {
+        if (ci_contains(s->title, q) || ci_contains(s->artist, q)) {
+            cb(s, ctx);
+            n++;
+        }
+    }
+    return n;
+}
+
+/* ====================================================================
+ * Deletion
+ * ==================================================================== */
+
+/*
+ * Unlink `s` from the list and free it.
+ *
+ * Before:   [p] <-> [s] <-> [n]          (p and/or n may be NULL)
+ * After:    [p] <-> [n]
+ *
+ * Pointer changes:
+ *   - if s has a predecessor:  p->next = n        else head = n  (s was head)
+ *   - if s has a successor:    n->prev = p        else tail = p  (s was tail)
+ * A single-song list works too: both branches fall to head = tail = NULL.
+ *
+ * If s is the song now playing, "current" moves to its successor, or to
+ * its predecessor when s was the tail (NULL if the list becomes empty).
+ */
+static void unlink_and_free(Playlist *pl, Song *s)
+{
+    if (s->prev) s->prev->next = s->next;
+    else         pl->head      = s->next;
+
+    if (s->next) s->next->prev = s->prev;
+    else         pl->tail      = s->prev;
+
+    if (pl->current == s)
+        pl->current = s->next ? s->next : s->prev;
+
+    free(s);
+    pl->count--;
+}
+
+PlResult pl_delete_by_id(Playlist *pl, int id)
+{
+    Song *s = pl_find_by_id(pl, id);
+    if (!s) return PL_ERR_NOT_FOUND;
+    unlink_and_free(pl, s);
+    return PL_OK;
+}
+
+PlResult pl_delete_by_title(Playlist *pl, const char *title)
+{
+    Song *s;
+    if (!title) return PL_ERR_INVALID;
+    s = pl_find_by_title(pl, title);
+    if (!s) return PL_ERR_NOT_FOUND;
+    unlink_and_free(pl, s);
+    return PL_OK;
+}
+
+/* ====================================================================
+ * Player
+ * ==================================================================== */
+
+/* Move "now playing" forward.  Wraps to head only when repeat is on. */
+PlResult pl_play_next(Playlist *pl)
+{
+    if (!pl->head) return PL_ERR_EMPTY;
+    if (!pl->current)            pl->current = pl->head;
+    else if (pl->current->next)  pl->current = pl->current->next;
+    else if (pl->repeat)         pl->current = pl->head;     /* wrap around */
+    else                         return PL_ERR_END;
+    return PL_OK;
+}
+
+/* Move "now playing" backward.  Wraps to tail only when repeat is on. */
+PlResult pl_play_prev(Playlist *pl)
+{
+    if (!pl->head) return PL_ERR_EMPTY;
+    if (!pl->current)            pl->current = pl->head;
+    else if (pl->current->prev)  pl->current = pl->current->prev;
+    else if (pl->repeat)         pl->current = pl->tail;     /* wrap around */
+    else                         return PL_ERR_END;
+    return PL_OK;
+}
+
+PlResult pl_play_id(Playlist *pl, int id)
+{
+    Song *s = pl_find_by_id(pl, id);
+    if (!s) return PL_ERR_NOT_FOUND;
+    pl->current = s;
+    return PL_OK;
+}
+
+int pl_toggle_repeat(Playlist *pl)
+{
+    pl->repeat = !pl->repeat;
+    return pl->repeat;
+}
+
+/* ====================================================================
+ * Reordering
+ * ==================================================================== */
+
+/*
+ * Reverse in place by swapping the two pointers of every node.
+ *
+ * Before:   head -> [a] <-> [b] <-> [c] <- tail
+ *
+ * For each node we swap prev and next:
+ *     a: prev=NULL,next=b  ->  prev=b,   next=NULL
+ *     b: prev=a,   next=c  ->  prev=c,   next=a
+ *     c: prev=b,   next=NULL -> prev=NULL, next=b
+ * Finally swap head and tail:
+ *     head -> [c] <-> [b] <-> [a] <- tail
+ *
+ * After swapping, the old `next` is stored in `prev`, so the walk
+ * continues through s->prev.  No node is allocated or freed.
+ */
+void pl_reverse(Playlist *pl)
+{
+    Song *s = pl->head;
+    while (s) {
+        Song *old_next = s->next;
+        s->next = s->prev;
+        s->prev = old_next;
+        s = old_next;               /* continue to the original next node */
+    }
+    Song *tmp = pl->head;
+    pl->head = pl->tail;
+    pl->tail = tmp;
+}
+
+/* Comparison of two songs by the chosen key; ties keep original order. */
+static int song_cmp(const Song *a, const Song *b, PlSortKey key)
+{
+    switch (key) {
+    case PL_SORT_TITLE:    return ci_cmp(a->title,  b->title);
+    case PL_SORT_ARTIST:   return ci_cmp(a->artist, b->artist);
+    case PL_SORT_DURATION: return a->duration - b->duration;
+    }
+    return 0;
+}
+
+/* Merge two sorted singly-chained runs (following ->next only). Stable. */
+static Song *merge_runs(Song *a, Song *b, PlSortKey key)
+{
+    Song dummy, *tail = &dummy;
+    while (a && b) {
+        if (song_cmp(b, a, key) < 0) { tail->next = b; b = b->next; }
+        else                         { tail->next = a; a = a->next; }
+        tail = tail->next;
+    }
+    tail->next = a ? a : b;
+    return dummy.next;
+}
+
+/* Merge sort on the ->next chain.  Splits with slow/fast pointers. */
+static Song *merge_sort(Song *h, PlSortKey key)
+{
+    Song *slow, *fast, *second;
+    if (!h || !h->next) return h;
+
+    slow = h; fast = h->next;
+    while (fast && fast->next) { slow = slow->next; fast = fast->next->next; }
+    second = slow->next;
+    slow->next = NULL;              /* cut the list into two halves */
+
+    return merge_runs(merge_sort(h, key), merge_sort(second, key), key);
+}
+
+/*
+ * Sort by relinking.  Merge sort only touches ->next, so afterwards one
+ * pass repairs every ->prev pointer and finds the new tail.
+ */
+void pl_sort(Playlist *pl, PlSortKey key)
+{
+    Song *prev = NULL;
+    pl->head = merge_sort(pl->head, key);
+    for (Song *s = pl->head; s; s = s->next) {
+        s->prev = prev;
+        prev = s;
+    }
+    pl->tail = prev;
+}
+
+/*
+ * Fisher-Yates shuffle.  A linked list has no random access, so the node
+ * POINTERS are copied into a temporary array, shuffled, then used to
+ * relink the same nodes.  The array is freed before returning; songs are
+ * never stored in it permanently.
+ *
+ *   for i = n-1 down to 1:  j = random in [0, i];  swap(a[i], a[j])
+ */
+PlResult pl_shuffle(Playlist *pl)
+{
+    Song **a;
+    int n = pl->count, i = 0;
+
+    if (n < 2) return PL_OK;
+    a = malloc((size_t)n * sizeof *a);
+    if (!a) return PL_ERR_NOMEM;
+
+    for (Song *s = pl->head; s; s = s->next) a[i++] = s;
+
+    for (i = n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        Song *t = a[i]; a[i] = a[j]; a[j] = t;
+    }
+
+    for (i = 0; i < n; i++) {       /* relink in the shuffled order */
+        a[i]->prev = (i > 0)     ? a[i - 1] : NULL;
+        a[i]->next = (i < n - 1) ? a[i + 1] : NULL;
+    }
+    pl->head = a[0];
+    pl->tail = a[n - 1];
+    free(a);
+    return PL_OK;
+}
+
+/* ====================================================================
+ * Persistence
+ * ==================================================================== */
+
+PlResult pl_save(const Playlist *pl, const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return PL_ERR_IO;
+    for (const Song *s = pl->head; s; s = s->next)
+        fprintf(f, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", s->source, s->title,
+                s->artist, s->duration, s->spotify_uri, s->image_url,
+                s->audio_url);
+    return fclose(f) == 0 ? PL_OK : PL_ERR_IO;
+}
+
+/* Parse "123" fully; returns -1 when it is not a plain positive number. */
+static long parse_duration(const char *s)
+{
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 1 || v > PL_MAX_DURATION) return -1;
+    return v;
+}
+
+/*
+ * Turn one line of the save file into a SongInfo (pointers into `line`,
+ * which is modified).  Returns 0 for a malformed line.
+ *   new format: source TAB title TAB artist TAB duration TAB uri TAB image TAB audio
+ *   old format: title|artist|duration       (loaded as a local song)
+ */
+static int parse_line(char *line, SongInfo *info)
+{
+    char *field[7];
+    int n = 0;
+    long dur;
+
+    memset(info, 0, sizeof *info);
+    if (strchr(line, '\t')) {
+        char *p = line;
+        while (n < 7) {                         /* split on TAB, keep empty fields */
+            field[n++] = p;
+            p = strchr(p, '\t');
+            if (!p) break;
+            *p++ = '\0';
+        }
+        if (n != 7) return 0;
+        dur = parse_duration(field[3]);
+        if (dur < 0) return 0;
+        info->source = field[0];
+        info->title = field[1];
+        info->artist = field[2];
+        info->duration = (int)dur;
+        info->spotify_uri = field[4];
+        info->image_url = field[5];
+        info->audio_url = field[6];
+        return 1;
+    } else {
+        char *sep1 = strchr(line, '|');
+        char *sep2 = sep1 ? strchr(sep1 + 1, '|') : NULL;
+        if (!sep1 || !sep2) return 0;
+        *sep1 = *sep2 = '\0';
+        dur = parse_duration(sep2 + 1);
+        if (dur < 0) return 0;
+        info->title = line;
+        info->artist = sep1 + 1;
+        info->duration = (int)dur;
+        return 1;
+    }
+}
+
+/*
+ * Load into a temporary playlist first; only when the whole file has been
+ * read is the old content freed and replaced.  Malformed lines and
+ * duplicates are skipped.  Ids are reassigned, repeat is kept.
+ */
+PlResult pl_load(Playlist *pl, const char *path)
+{
+    Playlist tmp;
+    char line[PL_TITLE_MAX + PL_ARTIST_MAX + PL_URI_MAX + PL_IMAGE_MAX +
+              PL_AUDIO_MAX + 128];
+    FILE *f = fopen(path, "r");
+    if (!f) return PL_ERR_IO;
+
+    pl_init(&tmp);
+    while (fgets(line, sizeof line, f)) {
+        SongInfo info;
+        size_t len = strlen(line);
+
+        if (len > 0 && line[len - 1] != '\n' && !feof(f)) {
+            int c;                              /* over-long line: skip it */
+            while ((c = fgetc(f)) != EOF && c != '\n') {}
+            continue;
+        }
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0 || line[0] == '#') continue;
+        if (!parse_line(line, &info)) continue;
+
+        if (pl_add_end_info(&tmp, &info, NULL) == PL_ERR_NOMEM) {
+            pl_free(&tmp);
+            fclose(f);
+            return PL_ERR_NOMEM;
+        }
+    }
+    fclose(f);
+
+    tmp.repeat = pl->repeat;
+    tmp.current = tmp.head;
+    pl_free(pl);
+    *pl = tmp;
+    return PL_OK;
+}
+
+==============================================================================
+3. backend/server.c
+HTTP server: REST routing and JSON handling (uses playlist.h)
+==============================================================================
+/*
+ * server.c - HTTP routing and JSON handling (Mongoose).
+ *
+ * All song data lives in the doubly linked list from playlist.c; this file
+ * only translates HTTP requests into list operations and list contents
+ * into JSON.  Static files (the web UI) are served from the frontend dir.
+ *
+ * Spotify login/search/playback all happen in the browser (frontend/spotify.js);
+ * this server never sees a token or secret.  It only stores song metadata
+ * (including the spotify_uri to play) in the linked list, decides which song
+ * comes next/previous, and serves local MP3s from the music/ folder.
+ *
+ * Usage:  server [frontend_dir] [data_file] [music_dir]
+ *         defaults: ../frontend  ../data/playlist.txt  ../music   (run from backend/)
+ */
+#ifndef _WIN32
+#define _XOPEN_SOURCE 700   /* realpath() */
+#endif
+#include <limits.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "mongoose.h"
+#include "playlist.h"
+
+#define LISTEN_URL "http://0.0.0.0:8080"
+
+static Playlist g_pl;                       /* the one and only playlist */
+static const char *g_frontend = "../frontend";
+static const char *g_datafile = "../data/playlist.txt";
+static volatile int g_running = 1;
+static const char *g_music = "../music";
+static char g_frontend_abs[4096];
+static char g_music_abs[4096];
+static char g_root_spec[8300];              /* Mongoose root_dir: "/=frontend,/music=music" */
+
+static const char *CORS_JSON =
+    "Content-Type: application/json\r\n"
+    "Access-Control-Allow-Origin: *\r\n"
+    "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+    "Access-Control-Allow-Headers: Content-Type\r\n";
+
+/* ====================================================================
+ * Tiny growable string buffer used to build JSON by hand
+ * ==================================================================== */
+
+typedef struct { char *p; size_t len, cap; int oom; } Buf;
+
+static void buf_put(Buf *b, const char *s, size_t n)
+{
+    if (b->oom) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        char *np;
+        while (cap < b->len + n + 1) cap *= 2;
+        np = realloc(b->p, cap);
+        if (!np) { b->oom = 1; return; }
+        b->p = np; b->cap = cap;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = '\0';
+}
+
+static void buf_str(Buf *b, const char *s) { buf_put(b, s, strlen(s)); }
+
+static void buf_fmt(Buf *b, const char *fmt, ...)
+{
+    char tmp[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    buf_str(b, tmp);
+}
+
+/* Append s as a quoted, escaped JSON string. */
+static void buf_json_str(Buf *b, const char *s)
+{
+    buf_put(b, "\"", 1);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { char e[2] = { '\\', (char)c }; buf_put(b, e, 2); }
+        else if (c < 0x20)         { buf_fmt(b, "\\u%04x", c); }
+        else                       { buf_put(b, (const char *)&c, 1); }
+    }
+    buf_put(b, "\"", 1);
+}
+
+/* ====================================================================
+ * JSON serialisation of list contents
+ * ==================================================================== */
+
+static void song_json(Buf *b, const Song *s, int position)
+{
+    buf_fmt(b, "{\"id\":%d,\"position\":%d,\"title\":", s->id, position);
+    buf_json_str(b, s->title);
+    buf_str(b, ",\"artist\":");
+    buf_json_str(b, s->artist);
+    buf_fmt(b, ",\"duration\":%d,\"source\":", s->duration);
+    buf_json_str(b, s->source);
+    buf_str(b, ",\"spotify_uri\":");
+    buf_json_str(b, s->spotify_uri);
+    buf_str(b, ",\"image_url\":");
+    buf_json_str(b, s->image_url);
+    buf_str(b, ",\"audio_url\":");
+    buf_json_str(b, s->audio_url);
+    buf_str(b, "}");
+}
+
+/* "songs":[...] in forward or backward order (reverse walks tail->prev). */
+static void songs_array_json(Buf *b, int backwards)
+{
+    buf_str(b, "\"songs\":[");
+    if (backwards) {
+        int pos = g_pl.count;
+        for (const Song *s = g_pl.tail; s; s = s->prev, pos--) {
+            song_json(b, s, pos);
+            if (s->prev) buf_str(b, ",");
+        }
+    } else {
+        int pos = 1;
+        for (const Song *s = g_pl.head; s; s = s->next, pos++) {
+            song_json(b, s, pos);
+            if (s->next) buf_str(b, ",");
+        }
+    }
+    buf_str(b, "]");
+}
+
+/* Summary fields shared by most responses. */
+static void state_fields_json(Buf *b)
+{
+    buf_fmt(b, "\"count\":%d,\"totalDuration\":%d,\"currentId\":",
+            g_pl.count, pl_total_duration(&g_pl));
+    if (g_pl.current) buf_fmt(b, "%d", g_pl.current->id);
+    else              buf_str(b, "null");
+    buf_fmt(b, ",\"repeat\":%s", g_pl.repeat ? "true" : "false");
+}
+
+static int position_of(const Song *target)
+{
+    int pos = 1;
+    for (const Song *s = g_pl.head; s; s = s->next, pos++)
+        if (s == target) return pos;
+    return 0;
+}
+
+static void current_json(Buf *b)
+{
+    buf_str(b, "\"current\":");
+    if (g_pl.current) song_json(b, g_pl.current, position_of(g_pl.current));
+    else              buf_str(b, "null");
+}
+
+/* ====================================================================
+ * Replies
+ * ==================================================================== */
+
+static void reply_buf(struct mg_connection *c, int status, Buf *b)
+{
+    if (b->oom || !b->p) {
+        mg_http_reply(c, 500, CORS_JSON, "{\"error\":\"out of memory\"}");
+    } else {
+        mg_http_reply(c, status, CORS_JSON, "%.*s", (int)b->len, b->p);
+    }
+    free(b->p);
+}
+
+static void reply_error(struct mg_connection *c, int status, const char *msg)
+{
+    Buf b = {0};
+    buf_str(&b, "{\"error\":");
+    buf_json_str(&b, msg);
+    buf_str(&b, "}");
+    reply_buf(c, status, &b);
+}
+
+static int status_for(PlResult r)
+{
+    switch (r) {
+    case PL_ERR_NOT_FOUND: return 404;
+    case PL_ERR_NOMEM:
+    case PL_ERR_IO:        return 500;
+    default:               return 400;   /* invalid, duplicate, range, empty, end */
+    }
+}
+
+static void reply_pl_error(struct mg_connection *c, PlResult r)
+{
+    reply_error(c, status_for(r), pl_strerror(r));
+}
+
+/* {"message":..., full state (songs + summary + current)} */
+static void reply_state(struct mg_connection *c, int status, const char *msg,
+                        const Song *created)
+{
+    Buf b = {0};
+    buf_str(&b, "{\"message\":");
+    buf_json_str(&b, msg);
+    if (created) {
+        buf_str(&b, ",\"song\":");
+        song_json(&b, created, position_of(created));
+    }
+    buf_str(&b, ",");
+    songs_array_json(&b, 0);
+    buf_str(&b, ",");
+    state_fields_json(&b);
+    buf_str(&b, ",");
+    current_json(&b);
+    buf_str(&b, "}");
+    reply_buf(c, status, &b);
+}
+
+/* ====================================================================
+ * Request helpers
+ * ==================================================================== */
+
+static int route(const struct mg_http_message *hm, const char *method,
+                 const char *pattern)
+{
+    return mg_match(hm->method, mg_str(method), NULL) &&
+           mg_match(hm->uri, mg_str(pattern), NULL);
+}
+
+/* Does the (not NUL-terminated) string end with ".mp3", any case? */
+static int has_mp3_suffix(struct mg_str s)
+{
+    static const char ext[] = ".mp3";
+    if (s.len < 5) return 0;
+    for (size_t i = 0; i < 4; i++) {
+        char ch = s.buf[s.len - 4 + i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        if (ch != ext[i]) return 0;
+    }
+    return 1;
+}
+
+/* Parse the trailing "/<digits>" of a URI; returns 1 and sets *id on success. */
+static int id_from_uri(const struct mg_str uri, const char *prefix, int *id)
+{
+    size_t n = strlen(prefix);
+    long v = 0;
+    if (uri.len <= n || memcmp(uri.buf, prefix, n) != 0) return 0;
+    for (size_t i = n; i < uri.len; i++) {
+        if (uri.buf[i] < '0' || uri.buf[i] > '9') return 0;
+        v = v * 10 + (uri.buf[i] - '0');
+        if (v > 1000000000L) return 0;
+    }
+    *id = (int)v;
+    return 1;
+}
+
+/* Read an integer field that may be absent.  Returns 1 present, 0 absent,
+ * -1 present but not a whole number. */
+static int json_int(struct mg_str json, const char *path, long *out)
+{
+    double d;
+    if (!mg_json_get_num(json, path, &d)) return 0;
+    if (d != (double)(long)d || d < -1e9 || d > 1e9) return -1;
+    *out = (long)d;
+    return 1;
+}
+
+/* ====================================================================
+ * Handlers
+ * ==================================================================== */
+
+static void handle_add(struct mg_connection *c, struct mg_http_message *hm)
+{
+    char *title = mg_json_get_str(hm->body, "$.title");
+    char *artist = mg_json_get_str(hm->body, "$.artist");
+    char *at = mg_json_get_str(hm->body, "$.at");
+    char *uri = mg_json_get_str(hm->body, "$.spotify_uri");
+    char *image = mg_json_get_str(hm->body, "$.image_url");
+    char *source = mg_json_get_str(hm->body, "$.source");
+    char *audio = mg_json_get_str(hm->body, "$.audio_url");
+    SongInfo info;
+    long duration = 0, minutes = 0, seconds = 0, position = 0;
+    int has_dur = json_int(hm->body, "$.duration", &duration);
+    int has_min = json_int(hm->body, "$.minutes", &minutes);
+    int has_sec = json_int(hm->body, "$.seconds", &seconds);
+    int has_pos = json_int(hm->body, "$.position", &position);
+    const char *err = NULL;
+    PlResult r = PL_OK;
+    int new_id = 0;
+
+    if (!title || !artist)                          err = "title and artist are required";
+    else if (has_dur < 0 || has_min < 0 || has_sec < 0 || has_pos < 0)
+                                                    err = "duration, minutes, seconds and position must be whole numbers";
+    else if (has_dur == 0 && has_min == 0 && has_sec == 0)
+                                                    err = "duration is required (seconds, or minutes + seconds)";
+    else if (has_dur == 0) {                        /* minutes + seconds form */
+        if (seconds < 0 || seconds > 59)            err = "seconds must be between 0 and 59";
+        else if (minutes < 0)                       err = "minutes must not be negative";
+        else                                        duration = minutes * 60 + seconds;
+    }
+    if (!err && (duration < 1 || duration > 35999))
+        err = "duration must be between 1 and 35999 seconds";
+    if (!err && at && strcmp(at, "end") && strcmp(at, "start") && strcmp(at, "position"))
+        err = "at must be \"end\", \"start\" or \"position\"";
+
+    if (err) {
+        reply_error(c, 400, err);
+    } else {
+        /* "position" without "at" implies at:"position" */
+        const char *mode = at ? at : (has_pos == 1 ? "position" : "end");
+        info.title = title;
+        info.artist = artist;
+        info.duration = (int)duration;
+        info.spotify_uri = uri;
+        info.image_url = image;
+        info.source = source;
+        info.audio_url = audio;
+        if (!strcmp(mode, "start"))
+            r = pl_add_start_info(&g_pl, &info, &new_id);
+        else if (!strcmp(mode, "position")) {
+            if (has_pos != 1) { reply_error(c, 400, "position is required when at is \"position\""); goto done; }
+            r = pl_insert_at_info(&g_pl, (int)position, &info, &new_id);
+        } else
+            r = pl_add_end_info(&g_pl, &info, &new_id);
+
+        if (r == PL_OK) reply_state(c, 201, "song added", pl_find_by_id(&g_pl, new_id));
+        else            reply_pl_error(c, r);
+    }
+done:
+    free(title); free(artist); free(at);
+    free(uri); free(image); free(source); free(audio);
+}
+
+static void handle_delete(struct mg_connection *c, struct mg_http_message *hm)
+{
+    int id;
+    char title[PL_TITLE_MAX + 8];
+    PlResult r;
+
+    if (id_from_uri(hm->uri, "/api/songs/", &id)) {
+        r = pl_delete_by_id(&g_pl, id);
+    } else if (mg_match(hm->uri, mg_str("/api/songs"), NULL) &&
+               mg_http_get_var(&hm->query, "title", title, sizeof title) > 0) {
+        r = pl_delete_by_title(&g_pl, title);       /* DELETE /api/songs?title=... */
+    } else {
+        reply_error(c, 400, "use DELETE /api/songs/{id} or /api/songs?title=...");
+        return;
+    }
+    if (r == PL_OK) reply_state(c, 200, "song deleted", NULL);
+    else            reply_pl_error(c, r);
+}
+
+static void search_cb(const Song *s, void *ctx)
+{
+    Buf *b = ctx;
+    if (b->len > 0 && b->p[b->len - 1] != '[') buf_str(b, ",");
+    song_json(b, s, position_of(s));
+}
+
+static void handle_search(struct mg_connection *c, struct mg_http_message *hm)
+{
+    char q[256];
+    Buf b = {0};
+    int n;
+    if (mg_http_get_var(&hm->query, "q", q, sizeof q) < 0) {
+        reply_error(c, 400, "missing query parameter q");
+        return;
+    }
+    buf_str(&b, "{\"query\":");
+    buf_json_str(&b, q);
+    buf_str(&b, ",\"songs\":[");
+    n = pl_search(&g_pl, q, search_cb, &b);
+    buf_fmt(&b, "],\"count\":%d,\"currentId\":", n);
+    if (g_pl.current) buf_fmt(&b, "%d", g_pl.current->id); else buf_str(&b, "null");
+    buf_str(&b, "}");
+    reply_buf(c, 200, &b);
+}
+
+static void handle_list(struct mg_connection *c, int backwards)
+{
+    Buf b = {0};
+    buf_str(&b, "{");
+    songs_array_json(&b, backwards);
+    buf_str(&b, ",");
+    state_fields_json(&b);
+    buf_fmt(&b, ",\"order\":\"%s\"}", backwards ? "reverse" : "forward");
+    reply_buf(c, 200, &b);
+}
+
+static void handle_current(struct mg_connection *c)
+{
+    Buf b = {0};
+    buf_str(&b, "{");
+    current_json(&b);
+    buf_str(&b, ",");
+    state_fields_json(&b);
+    buf_str(&b, "}");
+    reply_buf(c, 200, &b);
+}
+
+static void handle_move(struct mg_connection *c, int forward)
+{
+    PlResult r = forward ? pl_play_next(&g_pl) : pl_play_prev(&g_pl);
+    if (r == PL_OK) reply_state(c, 200, forward ? "playing next" : "playing previous", NULL);
+    else            reply_pl_error(c, r);
+}
+
+/* ---- local MP3 files (music/ folder) ---- */
+
+static void local_file_cb(const char *name, void *ctx)
+{
+    Buf *b = ctx;
+    size_t n = strlen(name);
+    char enc[512];
+
+    if (n < 5 || n > 150 || b->oom) return;
+    if (mg_casecmp(name + n - 4, ".mp3") != 0) return;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)name[i] < 0x20) return;
+    if (mg_url_encode(name, n, enc, sizeof enc) == 0) return;
+
+    if (b->p[b->len - 1] != '[') buf_str(b, ",");
+    buf_str(b, "{\"name\":");
+    buf_json_str(b, name);
+    buf_str(b, ",\"url\":\"/music/");
+    buf_str(b, enc);
+    buf_str(b, "\"}");
+}
+
+/* GET /api/local-files: MP3s found in the music folder (scanned on every call). */
+static void handle_local_files(struct mg_connection *c)
+{
+    Buf b = {0};
+    buf_str(&b, "{\"files\":[");
+    if (g_music_abs[0]) mg_fs_posix.ls(g_music_abs, local_file_cb, &b);
+    buf_str(&b, "]}");
+    reply_buf(c, 200, &b);
+}
+
+static void handle_sort(struct mg_connection *c, struct mg_http_message *hm)
+{
+    char *by = mg_json_get_str(hm->body, "$.by");
+    PlSortKey key;
+    if (!by) { reply_error(c, 400, "body must be {\"by\":\"title\"|\"artist\"|\"duration\"}"); return; }
+    if      (!strcmp(by, "title"))    key = PL_SORT_TITLE;
+    else if (!strcmp(by, "artist"))   key = PL_SORT_ARTIST;
+    else if (!strcmp(by, "duration")) key = PL_SORT_DURATION;
+    else { free(by); reply_error(c, 400, "by must be title, artist or duration"); return; }
+    pl_sort(&g_pl, key);
+    {
+        char msg[64];
+        snprintf(msg, sizeof msg, "sorted by %s", by);
+        reply_state(c, 200, msg, NULL);
+    }
+    free(by);
+}
+
+/* ====================================================================
+ * Event handler / router
+ * ==================================================================== */
+
+static void on_event(struct mg_connection *c, int ev, void *ev_data)
+{
+    struct mg_http_message *hm;
+    if (ev != MG_EV_HTTP_MSG) return;
+    hm = (struct mg_http_message *) ev_data;
+
+    if (mg_match(hm->method, mg_str("OPTIONS"), NULL)) {        /* CORS preflight */
+        mg_http_reply(c, 204, CORS_JSON, "");
+    } else if (route(hm, "GET", "/api/songs"))           handle_list(c, 0);
+    else if (route(hm, "GET",  "/api/songs/reverse"))    handle_list(c, 1);
+    else if (route(hm, "GET",  "/api/songs/search"))     handle_search(c, hm);
+    else if (route(hm, "POST", "/api/songs"))            handle_add(c, hm);
+    else if (route(hm, "DELETE", "/api/songs") ||
+             route(hm, "DELETE", "/api/songs/*"))        handle_delete(c, hm);
+    else if (route(hm, "GET",  "/api/player/current"))   handle_current(c);
+    else if (route(hm, "POST", "/api/player/next"))      handle_move(c, 1);
+    else if (route(hm, "POST", "/api/player/prev"))      handle_move(c, 0);
+    else if (route(hm, "POST", "/api/player/repeat")) {
+        int on = pl_toggle_repeat(&g_pl);
+        reply_state(c, 200, on ? "repeat on" : "repeat off", NULL);
+    } else if (mg_match(hm->method, mg_str("POST"), NULL) &&
+               mg_match(hm->uri, mg_str("/api/player/play/*"), NULL)) {
+        int id;
+        if (!id_from_uri(hm->uri, "/api/player/play/", &id)) reply_error(c, 400, "invalid song id");
+        else {
+            PlResult r = pl_play_id(&g_pl, id);
+            if (r == PL_OK) reply_state(c, 200, "now playing", NULL);
+            else            reply_pl_error(c, r);
+        }
+    } else if (route(hm, "POST", "/api/playlist/reverse")) {
+        pl_reverse(&g_pl);
+        reply_state(c, 200, "playlist reversed", NULL);
+    } else if (route(hm, "POST", "/api/playlist/sort"))    handle_sort(c, hm);
+    else if (route(hm, "POST", "/api/playlist/shuffle")) {
+        PlResult r = pl_shuffle(&g_pl);
+        if (r == PL_OK) reply_state(c, 200, "playlist shuffled", NULL);
+        else            reply_pl_error(c, r);
+    } else if (route(hm, "POST", "/api/playlist/save")) {
+        PlResult r = pl_save(&g_pl, g_datafile);
+        if (r == PL_OK) reply_state(c, 200, "playlist saved", NULL);
+        else            reply_error(c, 500, "could not write the data file");
+    } else if (route(hm, "POST", "/api/playlist/load")) {
+        /* Load into a temporary list first so an empty/missing file never wipes the current playlist. */
+        Playlist tmp;
+        PlResult r;
+        pl_init(&tmp);
+        tmp.repeat = g_pl.repeat;
+        r = pl_load(&tmp, g_datafile);
+        if (r == PL_ERR_IO) {
+            reply_error(c, 404, "no saved playlist yet - press Save first");
+        } else if (r != PL_OK) {
+            reply_pl_error(c, r);
+        } else if (tmp.count == 0) {
+            pl_free(&tmp);
+            reply_error(c, 400, "the saved playlist is empty - press Save first (your current playlist was kept)");
+        } else {
+            pl_free(&g_pl);
+            g_pl = tmp;
+            reply_state(c, 200, "playlist loaded", NULL);
+        }
+    } else if (route(hm, "GET", "/api/local-files")) {
+        handle_local_files(c);
+    } else if (mg_match(hm->uri, mg_str("/api/*"), NULL)) {
+        reply_error(c, 404, "unknown API endpoint or method");
+    } else if (hm->uri.len >= 7 && memcmp(hm->uri.buf, "/music/", 7) == 0 &&
+               !has_mp3_suffix(hm->uri)) {
+        reply_error(c, 404, "only .mp3 files are served from /music/");
+    } else if (route(hm, "GET", "/callback")) {
+        /* Spotify redirects here after login; the page's JavaScript finishes the PKCE exchange. */
+        struct mg_http_serve_opts opts;
+        char page[sizeof g_frontend_abs + 16];
+        memset(&opts, 0, sizeof opts);
+        snprintf(page, sizeof page, "%s/index.html", g_frontend_abs);
+        mg_http_serve_file(c, hm, page, &opts);
+    } else {
+        struct mg_http_serve_opts opts;
+        memset(&opts, 0, sizeof opts);
+        opts.root_dir = g_root_spec;        /* "/" -> frontend, "/music" -> MP3 folder */
+        mg_http_serve_dir(c, hm, &opts);
+    }
+}
+
+/*
+ * Mongoose refuses a web root that contains "..", so turn a relative path
+ * such as ../frontend into an absolute one.  Returns 0 on failure.
+ */
+static int resolve_dir(const char *dir, char *out, size_t cap)
+{
+#ifdef _WIN32
+    return _fullpath(out, dir, cap) != NULL;
+#else
+    char tmp[PATH_MAX];
+    if (!realpath(dir, tmp) || strlen(tmp) >= cap) return 0;
+    strcpy(out, tmp);
+    return 1;
+#endif
+}
+
+static void on_signal(int sig) { (void)sig; g_running = 0; }
+
+int main(int argc, char **argv)
+{
+    struct mg_mgr mgr;
+    PlResult r;
+
+    if (argc > 1) g_frontend = argv[1];
+    if (argc > 2) g_datafile = argv[2];
+    if (argc > 3) g_music = argv[3];
+
+    if (!resolve_dir(g_frontend, g_frontend_abs, sizeof g_frontend_abs)) {
+        fprintf(stderr, "Frontend folder not found: %s\n"
+                        "Run from the backend/ folder or pass the path: server <frontend_dir> <data_file> <music_dir>\n",
+                g_frontend);
+        return 1;
+    }
+
+    /* The music folder is optional: without it only Spotify songs can play. */
+    if (resolve_dir(g_music, g_music_abs, sizeof g_music_abs) &&
+        (mg_fs_posix.st(g_music_abs, NULL, NULL) & MG_FS_DIR)) {
+        snprintf(g_root_spec, sizeof g_root_spec, "/=%s,/music=%s", g_frontend_abs, g_music_abs);
+        printf("Serving local MP3s from %s at /music/\n", g_music_abs);
+    } else {
+        g_music_abs[0] = '\0';
+        snprintf(g_root_spec, sizeof g_root_spec, "/=%s", g_frontend_abs);
+        printf("No music folder at %s (local MP3 playback disabled)\n", g_music);
+    }
+
+    srand((unsigned)time(NULL));
+    pl_init(&g_pl);
+    r = pl_load(&g_pl, g_datafile);
+    if (r == PL_OK) printf("Loaded %d song(s) from %s\n", g_pl.count, g_datafile);
+    else            printf("No saved playlist at %s (starting empty)\n", g_datafile);
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    mg_mgr_init(&mgr);
+    if (!mg_http_listen(&mgr, LISTEN_URL, on_event, NULL)) {
+        fprintf(stderr, "Cannot listen on %s (is the port in use?)\n", LISTEN_URL);
+        mg_mgr_free(&mgr);
+        pl_free(&g_pl);
+        return 1;
+    }
+    printf("Music Playlist server running: http://localhost:8080  (Ctrl+C to stop)\n");
+    while (g_running) mg_mgr_poll(&mgr, 200);
+
+    printf("\nShutting down...\n");
+    mg_mgr_free(&mgr);
+    pl_free(&g_pl);                         /* release every node */
+    return 0;
+}
+
+==============================================================================
+4. backend/test_playlist.c
+Standalone unit tests for the linked list (checks pointer invariants)
+==============================================================================
+/* Standalone tests for the linked list (no HTTP involved). */
+#include "playlist.h"
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* Verify every structural invariant of the doubly linked list. */
+static void check(const Playlist *pl)
+{
+    int n = 0;
+    const Song *prev = NULL;
+    for (const Song *s = pl->head; s; s = s->next) {
+        assert(s->prev == prev);
+        prev = s;
+        n++;
+    }
+    assert(prev == pl->tail);
+    assert(n == pl->count);
+    if (pl->count == 0) assert(!pl->head && !pl->tail && !pl->current);
+    else assert(pl->head->prev == NULL && pl->tail->next == NULL);
+    if (pl->current) assert(pl_find_by_id(pl, pl->current->id) == pl->current);
+    /* walking backwards must visit the same number of nodes */
+    n = 0;
+    for (const Song *s = pl->tail; s; s = s->prev) n++;
+    assert(n == pl->count);
+}
+
+static void titles(const Playlist *pl, char *out)
+{
+    out[0] = 0;
+    for (const Song *s = pl->head; s; s = s->next) { strcat(out, s->title); strcat(out, ","); }
+}
+
+static void count_cb(const Song *s, void *ctx) { (void)s; (*(int *)ctx)++; }
+
+int main(void)
+{
+    Playlist pl; char buf[512]; int id = 0, hits;
+    pl_init(&pl); check(&pl);
+
+    /* empty-list behaviour */
+    assert(pl_play_next(&pl) == PL_ERR_EMPTY);
+    assert(pl_play_prev(&pl) == PL_ERR_EMPTY);
+    assert(pl_delete_by_id(&pl, 1) == PL_ERR_NOT_FOUND);
+    pl_reverse(&pl); pl_sort(&pl, PL_SORT_TITLE); assert(pl_shuffle(&pl) == PL_OK); check(&pl);
+
+    /* adds */
+    assert(pl_add_end(&pl, "B", "x", 60, &id) == PL_OK && id == 1);
+    assert(pl.current && pl.current->id == 1);
+    assert(pl_add_end(&pl, "C", "y", 90, NULL) == PL_OK);
+    assert(pl_add_start(&pl, "A", "z", 30, NULL) == PL_OK);
+    titles(&pl, buf); assert(!strcmp(buf, "A,B,C,")); check(&pl);
+
+    /* insert: middle, position 1, count+1, out of range */
+    assert(pl_insert_at(&pl, 2, "M", "m", 10, NULL) == PL_OK);
+    titles(&pl, buf); assert(!strcmp(buf, "A,M,B,C,"));
+    assert(pl_insert_at(&pl, 1, "F", "f", 10, NULL) == PL_OK);
+    assert(pl_insert_at(&pl, 6, "L", "l", 10, NULL) == PL_OK);
+    titles(&pl, buf); assert(!strcmp(buf, "F,A,M,B,C,L,")); check(&pl);
+    assert(pl_insert_at(&pl, 0, "Q", "q", 10, NULL) == PL_ERR_RANGE);
+    assert(pl_insert_at(&pl, 8, "Q", "q", 10, NULL) == PL_ERR_RANGE);
+    assert(pl.count == 6);
+
+    /* validation */
+    assert(pl_add_end(&pl, "a", "dup", 10, NULL) == PL_ERR_DUPLICATE);   /* case-insensitive */
+    assert(pl_add_end(&pl, "  ", "x", 10, NULL) == PL_ERR_INVALID);
+    assert(pl_add_end(&pl, "T", "", 10, NULL) == PL_ERR_INVALID);
+    assert(pl_add_end(&pl, "T", "x", 0, NULL) == PL_ERR_INVALID);
+    assert(pl_add_end(&pl, "T|x", "x", 5, NULL) == PL_OK);               /* '|' is allowed now */
+    assert(pl_delete_by_title(&pl, "T|x") == PL_OK);
+    pl.nextId--;                                                        /* keep id arithmetic below simple */
+    assert(pl.count == 6 && pl.nextId == 7);                            /* failures burn no ids */
+
+    /* search */
+    hits = 0; assert(pl_search(&pl, "M", count_cb, &hits) == 1 && hits == 1);   /* song M matches in title and artist, counted once */
+    hits = 0; pl_search(&pl, "nomatch", count_cb, &hits); assert(hits == 0);
+
+    /* reverse / sort / shuffle keep invariants */
+    pl_reverse(&pl); check(&pl);
+    titles(&pl, buf); assert(!strcmp(buf, "L,C,B,M,A,F,"));
+    pl_sort(&pl, PL_SORT_TITLE); check(&pl);
+    titles(&pl, buf); assert(!strcmp(buf, "A,B,C,F,L,M,"));
+    pl_sort(&pl, PL_SORT_DURATION); check(&pl);
+    assert(pl.head->duration <= pl.head->next->duration);
+    pl_sort(&pl, PL_SORT_ARTIST); check(&pl);
+    srand((unsigned)time(NULL));
+    for (int i = 0; i < 50; i++) { assert(pl_shuffle(&pl) == PL_OK); check(&pl); }
+    pl_sort(&pl, PL_SORT_TITLE);
+
+    /* player + repeat */
+    pl_play_id(&pl, pl.head->id);
+    assert(pl_play_prev(&pl) == PL_ERR_END);
+    assert(pl_toggle_repeat(&pl) == 1);
+    assert(pl_play_prev(&pl) == PL_OK && pl.current == pl.tail);
+    assert(pl_play_next(&pl) == PL_OK && pl.current == pl.head);
+    pl_toggle_repeat(&pl);
+    pl.current = pl.tail;
+    assert(pl_play_next(&pl) == PL_ERR_END);
+
+    /* delete tail while playing it -> current moves to prev; head -> next */
+    id = pl.tail->id;
+    assert(pl_delete_by_id(&pl, id) == PL_OK); check(&pl);
+    assert(pl.current == pl.tail);
+    pl.current = pl.head;
+    assert(pl_delete_by_title(&pl, pl.head->title) == PL_OK); check(&pl);
+    assert(pl.current == pl.head);
+    assert(pl_delete_by_title(&pl, "nope") == PL_ERR_NOT_FOUND);
+    assert(pl_delete_by_id(&pl, 999) == PL_ERR_NOT_FOUND);
+
+    /* save / load round trip */
+    assert(pl_save(&pl, "/tmp/pl_test.txt") == PL_OK);
+    titles(&pl, buf);
+    { Playlist q; char b2[512]; pl_init(&q);
+      assert(pl_load(&q, "/tmp/pl_test.txt") == PL_OK); check(&q);
+      titles(&q, b2); assert(!strcmp(buf, b2)); assert(q.count == pl.count);
+      assert(pl_load(&q, "/nonexistent/file") == PL_ERR_IO && q.count == pl.count);
+      pl_free(&q); }
+
+    /* ---- Spotify / local fields ---- */
+    {
+        const char *U1 = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
+        const char *U2 = "spotify:track:7qiZfU4dY1lWllzX7mPBI3";
+        SongInfo s = { "Sp One", "Artist", 200, U1, "https://i.scdn.co/image/abc", NULL, NULL };
+        Playlist q; int sid = 0; pl_init(&q);
+
+        assert(pl_add_end_info(&q, &s, &sid) == PL_OK);
+        assert(!strcmp(q.head->source, "spotify"));                      /* inferred from the URI */
+        assert(!strcmp(q.head->spotify_uri, U1) && !strcmp(q.head->image_url, s.image_url));
+        assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_DUPLICATE);       /* same URI */
+        s.title = "Sp One"; s.spotify_uri = U2;
+        assert(pl_add_start_info(&q, &s, NULL) == PL_OK);                /* same title, other URI: fine */
+        assert(q.count == 2);
+
+        s.spotify_uri = "spotify:track:short";   assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.spotify_uri = "spotify:album:4cOdK2wGLETKBW3PvgPWqT";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.spotify_uri = "spotify:track:4cOdK2wGLETKBW3PvgPW!T"; assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.spotify_uri = "";                       s.source = "spotify";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);  /* spotify needs a URI */
+        s.source = "tape"; s.spotify_uri = U2;    assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.source = NULL;   s.image_url = "http://insecure/x.jpg";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);
+        s.image_url = NULL; s.audio_url = "/music/a.mp3";
+                                                  assert(pl_add_end_info(&q, &s, NULL) == PL_ERR_INVALID);  /* spotify + audio */
+        assert(q.count == 2);
+
+        { SongInfo l = { "Local Tune", "Me", 90, NULL, NULL, NULL, "/music/Local%20Tune.mp3" };
+          assert(pl_add_end_info(&q, &l, NULL) == PL_OK && !strcmp(q.tail->source, "local"));
+          l.title = "local tune";   assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_DUPLICATE);   /* local: by title */
+          l.title = "Other"; l.audio_url = "/etc/passwd";   assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_INVALID);
+          l.audio_url = "/music/../secret.mp3";             assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_INVALID);
+          l.audio_url = NULL; l.spotify_uri = U2; l.source = "local";
+                                                            assert(pl_add_end_info(&q, &l, NULL) == PL_ERR_INVALID);
+          l.spotify_uri = NULL; l.title = "Sp One";          /* a local song may share a Spotify song's title */
+          assert(pl_add_end_info(&q, &l, NULL) == PL_OK); }
+        assert(q.count == 4); check(&q);
+
+        /* save/load keeps every field, including '|' in a title */
+        { SongInfo p = { "Pipe | Title", "A | B", 61, U1 + 0, NULL, NULL, NULL };
+          Playlist r; char b1[512], b2[512]; pl_init(&r);
+          p.spotify_uri = "spotify:track:1111111111111111111111";
+          assert(pl_add_end_info(&q, &p, NULL) == PL_OK);
+          assert(pl_save(&q, "/tmp/pl_test2.txt") == PL_OK);
+          assert(pl_load(&r, "/tmp/pl_test2.txt") == PL_OK); check(&r);
+          assert(r.count == q.count);
+          for (const Song *a = q.head, *b = r.head; a; a = a->next, b = b->next) {
+              assert(!strcmp(a->title, b->title) && !strcmp(a->artist, b->artist));
+              assert(a->duration == b->duration && !strcmp(a->spotify_uri, b->spotify_uri));
+              assert(!strcmp(a->image_url, b->image_url) && !strcmp(a->source, b->source));
+              assert(!strcmp(a->audio_url, b->audio_url));
+          }
+          titles(&q, b1); titles(&r, b2); assert(!strcmp(b1, b2));
+          pl_free(&r); }
+
+        /* legacy pipe format + garbage lines */
+        { FILE *f = fopen("/tmp/pl_test3.txt", "w"); Playlist r; pl_init(&r);
+          fputs("Old Song|Old Artist|120\n# comment\n\nbroken line\nBad|x|abc\nlocal\tonly\tthree\n", f);
+          fclose(f);
+          assert(pl_load(&r, "/tmp/pl_test3.txt") == PL_OK && r.count == 1);
+          assert(!strcmp(r.head->source, "local") && r.head->duration == 120); check(&r);
+          pl_free(&r); }
+        pl_free(&q); check(&q);
+    }
+
+    /* single song, then delete everything */
+    while (pl.head) { assert(pl_delete_by_id(&pl, pl.head->id) == PL_OK); check(&pl); }
+    assert(pl.count == 0);
+    assert(pl_add_end(&pl, "Solo", "s", 5, NULL) == PL_OK);
+    assert(pl_play_next(&pl) == PL_ERR_END);
+    pl_toggle_repeat(&pl);
+    assert(pl_play_next(&pl) == PL_OK && pl.current == pl.head);
+    assert(pl_play_prev(&pl) == PL_OK && pl.current == pl.head);
+    pl_reverse(&pl); check(&pl);
+
+    pl_free(&pl); check(&pl);
+    puts("all playlist tests passed");
+    return 0;
+}
+
+==============================================================================
+5. backend/Makefile
+Build file for Linux and Windows (MinGW). Recipe lines must start with a TAB character
+==============================================================================
+# Music Playlist server - works with GCC on Linux and MinGW on Windows.
+CC      ?= gcc
+CFLAGS  := -Wall -Wextra -std=c99 -O2
+# Mongoose is third-party code: needs POSIX extensions (gnu99), no strict warnings.
+MGFLAGS := -std=gnu99 -O2 -w
+
+ifeq ($(OS),Windows_NT)
+  EXE  := server.exe
+  TEST := test_playlist.exe
+  LIBS := -lws2_32
+  RM   := del /Q
+else
+  EXE  := server
+  TEST := test_playlist
+  LIBS :=
+  RM   := rm -f
+endif
+
+all: $(EXE)
+
+$(EXE): server.o playlist.o mongoose.o
+	$(CC) -o $@ $^ $(LIBS)
+
+server.o: server.c playlist.h mongoose.h
+	$(CC) $(CFLAGS) -c server.c
+
+playlist.o: playlist.c playlist.h
+	$(CC) $(CFLAGS) -c playlist.c
+
+mongoose.o: mongoose.c mongoose.h
+	$(CC) $(MGFLAGS) -c mongoose.c
+
+# Linked list unit tests (no networking involved)
+test: $(TEST)
+	./$(TEST)
+
+$(TEST): test_playlist.c playlist.c playlist.h
+	$(CC) $(CFLAGS) -g -o $@ test_playlist.c playlist.c
+
+run: $(EXE)
+	./$(EXE)
+
+clean:
+	$(RM) *.o $(EXE) $(TEST)
+
+.PHONY: all test run clean
+
+==============================================================================
+6. frontend/index.html
+Web page structure
+==============================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Music Playlist Manager</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>&#9835; Playlist Manager</h1>
+    <p class="subtitle">Doubly linked list in C &middot; REST API &middot; Spotify playback</p>
+  </header>
+
+  <main class="layout">
+    <!-- Playlist (order and Next/Previous come from the C linked list) -->
+    <section class="panel playlist-panel">
+      <div class="panel-head">
+        <h2>Playlist</h2>
+        <div class="stats">
+          <span><strong id="stat-count">0</strong> songs</span>
+          <span><strong id="stat-duration">00:00</strong> total</span>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <input id="search" type="search" placeholder="Filter playlist by title or artist..." aria-label="Filter playlist">
+        <button id="btn-reverse" title="Reverse the list in place (swaps prev/next pointers)">Reverse</button>
+        <button id="btn-view-reverse" title="Show the list from the tail using prev pointers (does not change it)">View reversed</button>
+        <select id="sort-by" aria-label="Sort by">
+          <option value="title">Title</option>
+          <option value="artist">Artist</option>
+          <option value="duration">Duration</option>
+        </select>
+        <button id="btn-sort">Sort</button>
+        <button id="btn-shuffle">Shuffle</button>
+        <button id="btn-save">Save</button>
+        <button id="btn-load">Load</button>
+      </div>
+
+      <div id="view-note" class="view-note" hidden></div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>#</th><th>Title</th><th>Artist</th><th>Time</th><th></th></tr>
+          </thead>
+          <tbody id="song-rows"></tbody>
+        </table>
+        <p id="empty" class="empty" hidden></p>
+      </div>
+    </section>
+
+    <!-- Now playing -->
+    <section class="panel now-playing">
+      <h2>Now Playing</h2>
+      <div class="art" id="art"><img id="art-img" alt="" hidden><span id="art-ph" class="art-ph">&#9835;</span></div>
+      <div id="np-title" class="np-title">Nothing playing</div>
+      <div id="np-artist" class="np-artist">&mdash;</div>
+      <input id="seek" class="slider" type="range" min="0" max="0" value="0" step="1" aria-label="Seek" disabled>
+      <div class="times"><span id="np-elapsed">00:00</span><span id="np-length">00:00</span></div>
+      <div class="controls">
+        <button id="btn-prev" aria-label="Previous">&#9198;</button>
+        <button id="btn-play" class="primary" aria-label="Play or pause">&#9654;</button>
+        <button id="btn-next" aria-label="Next">&#9197;</button>
+        <button id="btn-repeat" aria-pressed="false" title="Repeat: wrap around at the ends">&#8635; Repeat</button>
+      </div>
+      <label class="volume">&#128266;
+        <input id="volume" class="slider" type="range" min="0" max="100" value="80" aria-label="Volume">
+      </label>
+    </section>
+
+    <!-- Find songs: Spotify search + local MP3s -->
+    <section class="panel find-panel">
+      <div class="panel-head">
+        <h2>Find songs</h2>
+        <div class="auth">
+          <span id="sp-user" class="sp-user" hidden></span>
+          <button id="sp-login" class="primary">Login with Spotify</button>
+          <button id="sp-logout" hidden>Log out</button>
+        </div>
+      </div>
+      <div id="sp-banner" class="banner" hidden></div>
+
+      <form id="sp-form" autocomplete="off">
+        <input id="sp-q" type="search" placeholder="Search Spotify tracks..." aria-label="Search Spotify">
+        <button type="submit">Search</button>
+      </form>
+
+      <div class="insert-bar">
+        <label>Add to
+          <select id="ins-at" aria-label="Where to insert">
+            <option value="end">the end</option>
+            <option value="start">the start</option>
+            <option value="position">position...</option>
+          </select>
+        </label>
+        <label id="ins-pos-label" hidden><input id="ins-pos" type="number" min="1" value="1" aria-label="Position"></label>
+      </div>
+
+      <ul id="sp-results" class="results"></ul>
+      <button id="sp-more" class="wide" hidden>Load more</button>
+
+      <h3>Local MP3s <small>(files in the <code>music/</code> folder)</small>
+        <button id="local-refresh" class="small">Refresh</button></h3>
+      <ul id="local-list" class="results"></ul>
+      <p id="local-empty" class="empty small" hidden>No MP3 files found. Put some in the <code>music/</code> folder.</p>
+    </section>
+
+    <!-- Manual add (no audio) -->
+    <section class="panel add-panel">
+      <h2>Add manually <small>(no audio)</small></h2>
+      <form id="add-form" autocomplete="off">
+        <label>Title <input id="f-title" required maxlength="99"></label>
+        <label>Artist <input id="f-artist" required maxlength="99"></label>
+        <div class="row">
+          <label>Minutes <input id="f-min" type="number" min="0" max="599" value="3" required></label>
+          <label>Seconds <input id="f-sec" type="number" min="0" max="59" value="0" required></label>
+        </div>
+        <div class="row">
+          <label>Insert
+            <select id="f-at">
+              <option value="end">At the end</option>
+              <option value="start">At the start</option>
+              <option value="position">At position...</option>
+            </select>
+          </label>
+          <label id="pos-label" hidden>Position <input id="f-pos" type="number" min="1" value="1"></label>
+        </div>
+        <button type="submit" class="primary wide">Add song</button>
+      </form>
+    </section>
+  </main>
+
+  <audio id="audio" preload="none"></audio>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="config.js"></script>
+  <script src="spotify.js"></script>
+  <script src="app.js"></script>
+  <script src="fx.js"></script>
+</body>
+</html>
+
+==============================================================================
+7. frontend/style.css
+Styling: layout, glass panels, sliders, cursor
+==============================================================================
+:root {
+  --bg: #0f1117; --panel: #181b24; --panel-2: #20242f; --line: #2b3040;
+  --text: #e8eaf0; --muted: #8b92a5; --accent: #7c5cff; --accent-2: #b39dff;
+  --ok: #2ecc8f; --err: #ff5d6c; --play-row: rgba(124, 92, 255, .18);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.topbar { padding: 20px 24px 4px; max-width: 1200px; margin: 0 auto; }
+.topbar h1 { margin: 0; font-size: 1.6rem; }
+.subtitle { margin: 2px 0 0; color: var(--muted); font-size: .85rem; }
+
+.layout {
+  max-width: 1280px; margin: 16px auto 40px; padding: 0 24px;
+  display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 20px; align-items: start;
+  grid-template-areas: "playlist now" "playlist find" "playlist add" "playlist .";
+  grid-template-rows: auto auto auto 1fr;
+}
+.layout > * { min-width: 0; }
+.playlist-panel { grid-area: playlist; }
+.now-playing { grid-area: now; }
+.find-panel { grid-area: find; }
+.add-panel { grid-area: add; }
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 18px;
+}
+.panel h2 { margin: 0 0 12px; font-size: 1.05rem; }
+.panel-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.stats { display: flex; gap: 16px; color: var(--muted); font-size: .9rem; }
+.stats strong { color: var(--text); }
+
+button, select, input {
+  font: inherit; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+}
+button { cursor: pointer; transition: background .15s, border-color .15s; }
+button:hover { border-color: var(--accent-2); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { background: #8d70ff; }
+button.wide { width: 100%; margin-top: 6px; }
+button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); }
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 1px; }
+
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 12px; }
+.toolbar input[type=search] { flex: 1 1 200px; min-width: 0; }
+.view-note { background: var(--panel-2); border-left: 3px solid var(--accent); padding: 6px 10px; margin-bottom: 10px; border-radius: 4px; color: var(--muted); font-size: .85rem; }
+
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td.title { max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+th { color: var(--muted); font-weight: 500; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+tbody tr:hover { background: var(--panel-2); }
+tbody tr.playing { background: var(--play-row); box-shadow: inset 3px 0 0 var(--accent); }
+tbody tr.playing td.title { font-weight: 600; color: var(--accent-2); }
+td.title { cursor: pointer; }
+td.actions { text-align: right; }
+td.actions button { padding: 4px 9px; font-size: .85rem; }
+td.actions .del:hover { border-color: var(--err); color: var(--err); }
+.empty { text-align: center; color: var(--muted); padding: 28px 0; margin: 0; }
+
+.now-playing { text-align: center; }
+.art {
+  width: 200px; height: 200px; margin: 4px auto 14px; border-radius: 12px; overflow: hidden;
+  display: grid; place-items: center; color: #fff; font-size: 3.4rem;
+  background: radial-gradient(circle at 30% 30%, var(--accent-2), var(--accent) 60%, #3b2a99);
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+}
+.art img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.art.spinning { box-shadow: 0 8px 28px rgba(124, 92, 255, .45); }
+.np-title { font-size: 1.15rem; font-weight: 600; overflow-wrap: anywhere; }
+.np-artist { color: var(--muted); margin-bottom: 14px; overflow-wrap: anywhere; }
+.slider { width: 100%; padding: 0; border: 0; background: transparent; accent-color: var(--accent); cursor: pointer; }
+.slider:disabled { cursor: default; opacity: .5; }
+.volume { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 1rem; }
+.volume .slider { flex: 1; }
+.times { display: flex; justify-content: space-between; color: var(--muted); font-size: .8rem; margin: 4px 0 12px; }
+.controls { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; }
+.controls button { min-width: 44px; }
+
+form label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: 10px; }
+form label input, form label select { display: block; width: 100%; margin-top: 4px; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+.toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 10; max-width: calc(100vw - 32px); }
+.toast {
+  padding: 10px 14px; border-radius: 8px; background: var(--panel-2);
+  border-left: 4px solid var(--ok); box-shadow: 0 6px 20px rgba(0,0,0,.4);
+  animation: slide .2s ease-out;
+}
+.toast.error { border-left-color: var(--err); }
+@keyframes slide { from { opacity: 0; transform: translateY(8px); } }
+
+@media (max-width: 860px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr); padding: 0 14px;
+    grid-template-areas: "now" "playlist" "find" "add"; grid-template-rows: none;
+  }
+  .topbar { padding: 16px 14px 0; }
+}
+
+@media (max-width: 600px) {
+  /* fit the whole table without sideways scrolling */
+  th:first-child, td:first-child { display: none; }
+  th, td { white-space: normal; padding: 8px 4px; font-size: .88rem; overflow-wrap: anywhere; }
+  td:nth-child(4) { white-space: nowrap; }
+  td.title { max-width: none; }
+  td.actions { white-space: nowrap; overflow-wrap: normal; }
+  td.actions button { padding: 4px 7px; }
+  .toolbar button, .toolbar select { flex: 1 1 auto; }
+}
+
+/* ---- Spotify / find songs ---- */
+.panel small { color: var(--muted); font-weight: 400; }
+.panel h3 { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; font-size: .95rem; }
+.panel h3 .small { margin-left: auto; }
+button.small { padding: 3px 9px; font-size: .8rem; }
+.auth { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sp-user { color: var(--muted); font-size: .85rem; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.banner {
+  display: flex; gap: 8px; justify-content: space-between; align-items: flex-start;
+  background: rgba(255, 93, 108, .12); border: 1px solid var(--err); border-radius: 8px;
+  padding: 8px 10px; margin: 8px 0; font-size: .88rem;
+}
+#sp-form { display: flex; gap: 8px; margin: 8px 0; }
+#sp-form input { flex: 1; min-width: 0; }
+.insert-bar { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; font-size: .85rem; color: var(--muted); }
+.insert-bar label { display: flex; align-items: center; gap: 6px; margin: 0; }
+.insert-bar input[type=number] { width: 80px; padding: 5px 8px; }
+.insert-bar select { padding: 5px 8px; }
+.results { list-style: none; margin: 0; padding: 0; }
+.results li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.results li.none { color: var(--muted); justify-content: center; }
+.results .info { flex: 1; min-width: 0; }
+.results .r-title, .results .r-artist { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.results .r-artist { color: var(--muted); font-size: .82rem; }
+.results .r-dur { color: var(--muted); font-size: .82rem; }
+.thumb { width: 28px; height: 28px; border-radius: 4px; object-fit: cover; flex: none; background: var(--panel-2); }
+.thumb.big { width: 44px; height: 44px; }
+.thumb.ph { display: inline-grid; place-items: center; color: var(--muted); font-size: .9rem; }
+.title-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.title-text { overflow: hidden; text-overflow: ellipsis; }
+.badge { font-size: .65rem; padding: 1px 6px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); flex: none; }
+.badge.spotify { color: #1ed760; border-color: #1ed76066; }
+.empty.small { padding: 12px 0; font-size: .85rem; }
+code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+
+@media (max-width: 600px) {
+  .thumb:not(.big), .badge { display: none; }
+  .art { width: 160px; height: 160px; }
+}
+
+/* =====================================================================
+   Visual polish (effects live in fx.js; this is the look)
+   ===================================================================== */
+
+body {
+  background:
+    radial-gradient(1100px 650px at 12% -8%, rgba(124, 92, 255, .30), transparent 60%),
+    radial-gradient(900px 600px at 100% 8%, rgba(255, 122, 217, .16), transparent 60%),
+    radial-gradient(900px 600px at 50% 115%, rgba(110, 231, 255, .12), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+.topbar, .layout { position: relative; z-index: 1; }
+
+.topbar h1 {
+  display: inline-block; font-size: 2rem; letter-spacing: .01em;
+  background: linear-gradient(90deg, #b39dff, #ff7ad9, #6ee7ff, #b39dff);
+  background-size: 250% 100%; -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+  animation: titleShift 8s linear infinite;
+}
+@keyframes titleShift { to { background-position: 250% 0; } }
+
+/* frosted glass panels so the notes show through softly */
+.panel {
+  background: rgba(24, 27, 36, .58);
+  -webkit-backdrop-filter: blur(14px) saturate(1.25); backdrop-filter: blur(14px) saturate(1.25);
+  border: 1px solid rgba(255, 255, 255, .08);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .35), inset 0 1px 0 rgba(255, 255, 255, .05);
+  transition: border-color .25s, box-shadow .25s;
+}
+.panel:hover { border-color: rgba(179, 157, 255, .28); box-shadow: 0 14px 38px rgba(0, 0, 0, .42), 0 0 0 1px rgba(124, 92, 255, .10); }
+.panel h2 { display: flex; align-items: center; gap: 8px; }
+.panel h2::before {
+  content: ""; width: 4px; height: 1.05em; border-radius: 2px;
+  background: linear-gradient(180deg, #b39dff, #ff7ad9);
+}
+
+/* buttons */
+button { transition: transform .12s, background .18s, border-color .18s, box-shadow .18s; }
+button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(124, 92, 255, .25); }
+button:active:not(:disabled) { transform: translateY(0) scale(.97); }
+button.primary { background: linear-gradient(135deg, #7c5cff, #b05cff); border-color: transparent; box-shadow: 0 4px 14px rgba(124, 92, 255, .35); }
+button.primary:hover:not(:disabled) { background: linear-gradient(135deg, #8d70ff, #c06cff); box-shadow: 0 8px 22px rgba(176, 92, 255, .45); }
+button[aria-pressed="true"] { background: linear-gradient(135deg, #7c5cff, #b05cff); border-color: transparent; box-shadow: 0 0 16px rgba(124, 92, 255, .5); }
+button:disabled { opacity: .55; cursor: default; }
+input, select { transition: border-color .18s, box-shadow .18s, background .18s; }
+input:focus, select:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(124, 92, 255, .22); outline: none; }
+
+/* playlist rows */
+tbody tr { transition: background .15s; }
+tbody tr:hover { background: rgba(124, 92, 255, .10); }
+tbody tr.playing { background: linear-gradient(90deg, rgba(124, 92, 255, .30), rgba(255, 122, 217, .06)); }
+.thumb { box-shadow: 0 2px 8px rgba(0, 0, 0, .4); }
+
+/* equalizer on the playing row: bars move only while audio is playing */
+.eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; flex: none; }
+.eq i {
+  width: 3px; height: 100%; border-radius: 2px; background: linear-gradient(180deg, #ff7ad9, #b39dff);
+  transform: scaleY(.3); transform-origin: bottom; animation: eq .9s ease-in-out infinite; animation-play-state: paused;
+}
+.eq i:nth-child(2) { animation-delay: -.45s; }
+.eq i:nth-child(3) { animation-delay: -.2s; }
+body.is-playing .eq i { animation-play-state: running; }
+@keyframes eq { 0%, 100% { transform: scaleY(.25); } 50% { transform: scaleY(1); } }
+
+/* now playing */
+.art.spinning { animation: artGlow 2.6s ease-in-out infinite; }
+@keyframes artGlow {
+  0%, 100% { box-shadow: 0 8px 28px rgba(124, 92, 255, .40); transform: scale(1); }
+  50%      { box-shadow: 0 12px 46px rgba(255, 122, 217, .60); transform: scale(1.025); }
+}
+.np-title { font-size: 1.2rem; }
+
+/* sliders with a filled track (JS sets --pct) */
+.slider { -webkit-appearance: none; appearance: none; height: 6px; border-radius: 3px; --pct: 0%;
+  background: linear-gradient(to right, #b39dff 0, #ff7ad9 var(--pct), rgba(255, 255, 255, .12) var(--pct)); }
+.slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+  background: #fff; box-shadow: 0 0 0 3px rgba(124, 92, 255, .45), 0 0 12px rgba(255, 122, 217, .6); transition: transform .12s; }
+.slider:not(:disabled):hover::-webkit-slider-thumb { transform: scale(1.25); }
+.slider::-moz-range-thumb { width: 14px; height: 14px; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 0 0 3px rgba(124, 92, 255, .45); }
+.slider::-moz-range-track { background: transparent; }
+.volume .slider { margin: 0; }
+
+/* toasts */
+.toast {
+  background: rgba(32, 36, 47, .92); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, .08); border-left-width: 4px;
+}
+
+/* ---- custom cursor (only added by fx.js on mouse devices) ---- */
+html.fx-cursor, html.fx-cursor * { cursor: none !important; }
+#cur-dot, #cur-ring {
+  position: fixed; left: 0; top: 0; pointer-events: none; z-index: 9999; border-radius: 50%;
+  opacity: 0; will-change: transform;
+}
+#cur-dot { width: 8px; height: 8px; margin: -4px 0 0 -4px; background: #fff; box-shadow: 0 0 12px 3px rgba(179, 157, 255, .9); transition: opacity .2s; }
+#cur-ring {
+  width: 38px; height: 38px; margin: -19px 0 0 -19px; border: 2px solid rgba(179, 157, 255, .75);
+  box-shadow: 0 0 16px rgba(124, 92, 255, .45), inset 0 0 12px rgba(124, 92, 255, .25);
+  transition: opacity .2s, width .18s, height .18s, margin .18s, background .18s, border-color .18s, border-width .12s;
+}
+#cur-ring.hot { width: 58px; height: 58px; margin: -29px 0 0 -29px; border-color: #ff7ad9; background: rgba(255, 122, 217, .14); }
+#cur-ring.down { border-width: 5px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .topbar h1, .art.spinning, .eq i { animation: none; }
+  button, .panel { transition: none; }
+}
+
+==============================================================================
+8. frontend/app.js
+Playlist UI, playback engine, calls the C REST API
+==============================================================================
+/*
+ * Music Playlist Manager - UI.
+ *
+ * Order, Next and Previous ALWAYS come from the C linked list through the
+ * REST API (/api/player/next, /api/player/prev).  The API answers with the
+ * song that is now current; this file then plays it:
+ *   - source "spotify": through the Spotify Web Playback SDK (spotify.js)
+ *   - source "local":   through an HTML5 <audio> element (/music/<file>.mp3)
+ * Spotify's own next/previous/queue endpoints are never used.
+ */
+(function () {
+  'use strict';
+
+  // Spotify only accepts the redirect URI http://127.0.0.1:8080/callback, and
+  // browser storage is per-origin, so always run on 127.0.0.1.
+  if (location.hostname === 'localhost') {
+    location.replace(location.href.replace('//localhost', '//127.0.0.1'));
+    return;
+  }
+
+  var $ = function (id) { return document.getElementById(id); };
+  var audio = $('audio');
+  var MSG = SP.MESSAGES;
+
+  var state = { songs: [], count: 0, totalDuration: 0, currentId: null, repeat: false };
+  var viewReversed = false;
+  var searchQuery = '';
+  var searchSeq = 0;               // ignore out-of-date playlist-filter responses
+
+  /* ---------- helpers ---------- */
+
+  function fmt(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    var m = Math.floor(sec / 60), s = sec % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  var lastToast = { msg: '', at: 0 };
+  function toast(msg, isError) {
+    var now = Date.now();
+    if (msg === lastToast.msg && now - lastToast.at < 2000) return;   // swallow duplicates
+    lastToast = { msg: msg, at: now };
+    var el = document.createElement('div');
+    el.className = 'toast' + (isError ? ' error' : '');
+    el.textContent = msg;
+    $('toasts').appendChild(el);
+    setTimeout(function () { el.remove(); }, isError ? 6000 : 3200);
+  }
+
+  function showBanner(msg) {
+    var b = $('sp-banner');
+    b.textContent = '';
+    var t = document.createElement('span');
+    t.textContent = msg;
+    var x = document.createElement('button');
+    x.className = 'small';
+    x.textContent = '×';
+    x.setAttribute('aria-label', 'Dismiss');
+    x.addEventListener('click', function () { b.hidden = true; });
+    b.appendChild(t);
+    b.appendChild(x);
+    b.hidden = false;
+  }
+
+  // Every call returns parsed JSON; HTTP errors throw with the server's message.
+  function api(method, path, body) {
+    var opts = { method: method, headers: {} };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(path, opts).catch(function () {
+      throw new Error('Cannot reach the playlist server. Is it running on port 8080?');
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        return data;
+      });
+    });
+  }
+
+  var BANNER_CODES = ['drm', 'premium', 'expired', 'not_logged_in', 'not_configured', 'forbidden'];
+  function fail(err) {
+    var msg = (err && err.message) || 'Request failed';
+    toast(msg, true);
+    if (err && BANNER_CODES.indexOf(err.code) >= 0) showBanner(msg);
+    if (err && err.code === 'expired') renderAuth();
+  }
+
+  function trunc(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+
+  /* ---------- playback engine (Spotify or local audio) ---------- */
+
+  // songId: the playlist song being played; kind: "spotify" | "local" | null
+  var engine = { songId: null, kind: null, uri: null, playing: false, pos: 0, dur: 0, stamp: 0 };
+  var seeking = false;
+
+  function currentSong() {
+    for (var i = 0; i < state.songs.length; i++)
+      if (state.songs[i].id === state.currentId) return state.songs[i];
+    return null;
+  }
+
+  function enginePos() {
+    if (!engine.kind) return 0;
+    if (engine.kind === 'local') return audio.currentTime || 0;
+    return engine.pos + (engine.playing ? (performance.now() - engine.stamp) / 1000 : 0);
+  }
+
+  function volume() { return parseInt($('volume').value, 10) / 100; }
+
+  function stopEngine() {
+    audio.pause();
+    if (engine.kind === 'spotify') SP.pause().catch(function () {});
+    engine = { songId: null, kind: null, uri: null, playing: false, pos: 0, dur: 0, stamp: 0 };
+    renderTransport();
+  }
+
+  function startSpotifyPlayer() {
+    return SP.initPlayer({
+      state: onSpotifyState,
+      ended: onTrackEnded,
+      error: fail
+    }, volume());
+  }
+
+  function onSpotifyState(s) {
+    if (engine.kind !== 'spotify' || s.uri !== engine.uri) return;
+    engine.pos = s.position / 1000;
+    engine.dur = s.duration / 1000;
+    engine.playing = !s.paused;
+    engine.stamp = performance.now();
+    renderTransport();
+  }
+
+  // Both players call this when the song finishes: ask the C list for the next one.
+  function onTrackEnded() {
+    if (engine.endFired) return;                   // the SDK event and the timer below may both report the end
+    engine.endFired = true;
+    engine.playing = false;
+    advance('/api/player/next', true);
+  }
+
+  // Safety net for Spotify: if the clock runs well past the track length and no
+  // "ended" state arrived from the SDK, treat the track as finished.
+  function checkSpotifyEnd() {
+    if (engine.kind === 'spotify' && engine.playing && !engine.endFired &&
+        engine.dur > 0 && enginePos() >= engine.dur + 1.5) onTrackEnded();
+  }
+
+  // Start playing a song object (the one the C backend says is current).
+  function playSong(song) {
+    if (!song) { stopEngine(); return Promise.resolve(); }
+
+    if (song.source === 'spotify') {
+      if (!SP.isConfigured()) { fail(SP.SpotifyError('not_configured')); stopEngine(); return Promise.resolve(); }
+      if (!SP.isLoggedIn())   { fail(SP.SpotifyError('not_logged_in')); stopEngine(); return Promise.resolve(); }
+      audio.pause();
+      engine = { songId: song.id, kind: 'spotify', uri: song.spotify_uri, playing: true, pos: 0, dur: song.duration, stamp: performance.now() };
+      renderTransport();
+      return startSpotifyPlayer().then(function () { return SP.play(song.spotify_uri); }).catch(function (e) {
+        engine.playing = false;
+        renderTransport();
+        fail(e);
+      });
+    }
+
+    // local song
+    if (engine.kind === 'spotify') SP.pause().catch(function () {});
+    if (!song.audio_url) {
+      engine = { songId: null, kind: null, uri: null, playing: false, pos: 0, dur: 0, stamp: 0 };
+      audio.pause();
+      renderTransport();
+      toast('"' + song.title + '" has no audio file. Add MP3s to the music/ folder or search Spotify.', true);
+      return Promise.resolve();
+    }
+    engine = { songId: song.id, kind: 'local', uri: null, playing: true, pos: 0, dur: song.duration, stamp: 0 };
+    audio.src = song.audio_url;
+    audio.volume = volume();
+    renderTransport();
+    return audio.play().catch(function () {
+      engine.playing = false;
+      renderTransport();
+      toast('Could not play "' + song.title + '". Is the file still in the music/ folder?', true);
+    });
+  }
+
+  // Next / Previous: the C linked list decides, then we play what it returns.
+  function advance(path, auto) {
+    return api('POST', path).then(function (d) {
+      applyState(d, true);
+      return playSong(d.current || currentSong());
+    }).catch(function (err) {
+      if (auto) {
+        engine.playing = false;
+        renderTransport();
+        toast('Reached the end of the playlist');
+      } else {
+        fail(err);
+      }
+    });
+  }
+
+  function playId(id) {
+    api('POST', '/api/player/play/' + id).then(function (d) {
+      applyState(d, true);
+      return playSong(d.current || currentSong());
+    }).catch(fail);
+  }
+
+  audio.addEventListener('ended', function () { if (engine.kind === 'local') onTrackEnded(); });
+  audio.addEventListener('play', function () { if (engine.kind === 'local') { engine.playing = true; renderTransport(); } });
+  audio.addEventListener('pause', function () { if (engine.kind === 'local' && !audio.ended) { engine.playing = false; renderTransport(); } });
+  audio.addEventListener('loadedmetadata', function () { if (engine.kind === 'local' && isFinite(audio.duration)) engine.dur = audio.duration; });
+
+  /* ---------- rendering ---------- */
+
+  function thumb(url, cls) {
+    var el;
+    if (url) {
+      el = document.createElement('img');
+      el.src = url;
+      el.alt = '';
+      el.loading = 'lazy';
+      el.referrerPolicy = 'no-referrer';
+    } else {
+      el = document.createElement('span');
+      el.textContent = '♫';
+    }
+    el.className = cls + (url ? '' : ' ph');
+    return el;
+  }
+
+  function renderRows(songs) {
+    var body = $('song-rows');
+    body.textContent = '';
+    songs.forEach(function (s) {
+      var tr = document.createElement('tr');
+      if (s.id === state.currentId) tr.className = 'playing';
+
+      function cell(text, cls) {
+        var td = document.createElement('td');
+        td.textContent = text;
+        if (cls) td.className = cls;
+        tr.appendChild(td);
+        return td;
+      }
+      cell(s.position);
+
+      var t = cell('', 'title');
+      var wrap = document.createElement('div');
+      wrap.className = 'title-wrap';
+      wrap.appendChild(thumb(s.image_url, 'thumb'));
+      if (s.id === state.currentId) {                 // animated equalizer on the current row
+        var eq = document.createElement('span');
+        eq.className = 'eq';
+        eq.innerHTML = '<i></i><i></i><i></i>';
+        wrap.appendChild(eq);
+      }
+      var txt = document.createElement('span');
+      txt.className = 'title-text';
+      txt.textContent = s.title;
+      wrap.appendChild(txt);
+      var badge = document.createElement('span');
+      badge.className = 'badge ' + s.source;
+      badge.textContent = s.source === 'spotify' ? 'Spotify' : (s.audio_url ? 'MP3' : 'no audio');
+      wrap.appendChild(badge);
+      t.appendChild(wrap);
+      t.title = 'Click to play';
+      t.addEventListener('click', function () { playId(s.id); });
+
+      cell(s.artist, 'artist');
+      cell(fmt(s.duration), 'time');
+
+      var act = cell('', 'actions');
+      var del = document.createElement('button');
+      del.className = 'del';
+      del.textContent = 'Delete';
+      del.setAttribute('aria-label', 'Delete ' + s.title);
+      del.addEventListener('click', function () {
+        api('DELETE', '/api/songs/' + s.id).then(applyState).catch(fail);
+      });
+      act.appendChild(del);
+      body.appendChild(tr);
+    });
+  }
+
+  function renderList(songs) {
+    renderRows(songs);
+    var empty = $('empty');
+    if (songs.length === 0) {
+      empty.hidden = false;
+      empty.textContent = searchQuery ? 'No songs match "' + searchQuery + '".' : 'The playlist is empty. Search Spotify to add songs!';
+    } else {
+      empty.hidden = true;
+    }
+    var note = $('view-note');
+    var msgs = [];
+    if (searchQuery) msgs.push('Showing ' + songs.length + ' result(s) for "' + searchQuery + '"');
+    if (viewReversed) msgs.push('Viewing in reverse order (tail to head)');
+    note.hidden = msgs.length === 0;
+    note.textContent = msgs.join(' — ');
+    $('btn-view-reverse').setAttribute('aria-pressed', viewReversed ? 'true' : 'false');
+  }
+
+  // Now-playing card + seek bar + play button; also called by the 250 ms ticker.
+  function renderTransport() {
+    var cur = currentSong();
+    var active = !!(cur && engine.kind && engine.songId === cur.id);
+    var dur = active ? (engine.dur || cur.duration) : (cur ? cur.duration : 0);
+    var pos = active ? Math.min(enginePos(), dur) : 0;
+
+    $('np-title').textContent = cur ? cur.title : 'Nothing playing';
+    $('np-artist').textContent = cur ? cur.artist : '—';
+    var img = $('art-img');
+    if (cur && cur.image_url) {
+      if (img.getAttribute('src') !== cur.image_url) img.src = cur.image_url;
+      img.hidden = false;
+      $('art-ph').hidden = true;
+    } else {
+      img.removeAttribute('src');
+      img.hidden = true;
+      $('art-ph').hidden = false;
+    }
+    $('art').classList.toggle('spinning', active && engine.playing);
+    document.body.classList.toggle('is-playing', !!(active && engine.playing));
+    $('np-length').textContent = fmt(dur);
+    $('btn-repeat').setAttribute('aria-pressed', state.repeat ? 'true' : 'false');
+    $('btn-repeat').textContent = '\u21bb Repeat: ' + (state.repeat ? 'On' : 'Off');
+    $('btn-play').innerHTML = active && engine.playing ? '&#9208;' : '&#9654;';
+
+    var seek = $('seek');
+    seek.disabled = !active;
+    seek.max = Math.max(1, Math.round(dur));
+    if (!seeking) {
+      seek.value = Math.round(pos);
+    fillSlider(seek);
+      $('np-elapsed').textContent = fmt(pos);
+    }
+  }
+
+  // paint the filled part of a range slider (CSS reads --pct)
+  function fillSlider(el) {
+    var max = parseFloat(el.max) || 1;
+    el.style.setProperty('--pct', Math.min(100, Math.max(0, parseFloat(el.value) / max * 100)) + '%');
+  }
+
+  function renderStats() {
+    $('stat-count').textContent = state.count;
+    $('stat-duration').textContent = fmt(state.totalDuration);
+  }
+
+  function render() {
+    renderStats();
+    renderTransport();
+    renderResults();
+    renderLocal();
+    if (searchQuery) return;                       // filter results render themselves
+    renderList(viewReversed ? state.songs.slice().reverse() : state.songs);
+  }
+
+  // Take the full-state payload the API returns after any change.
+  function applyState(data, quiet) {
+    if (data.songs) state.songs = data.songs;
+    ['count', 'totalDuration', 'currentId', 'repeat'].forEach(function (k) {
+      if (data[k] !== undefined) state[k] = data[k];
+    });
+    if (data.message && !quiet) toast(data.message);
+    // the song that was playing got deleted: stop its audio
+    if (engine.songId !== null && !state.songs.some(function (s) { return s.id === engine.songId; })) stopEngine();
+    render();
+    if (searchQuery) runFilter();
+  }
+
+  setInterval(function () { renderTransport(); checkSpotifyEnd(); }, 250);
+
+  /* ---------- playlist actions ---------- */
+
+  function runFilter() {
+    var mine = ++searchSeq;
+    api('GET', '/api/songs/search?q=' + encodeURIComponent(searchQuery)).then(function (d) {
+      if (mine !== searchSeq || !searchQuery) return;
+      renderList(viewReversed ? d.songs.slice().reverse() : d.songs);
+    }).catch(fail);
+  }
+
+  function loadAll() {
+    return api('GET', '/api/songs').then(function (d) { applyState(d); }).catch(fail);
+  }
+
+  $('btn-next').addEventListener('click', function () { SP.activate(); advance('/api/player/next', false); });
+  $('btn-prev').addEventListener('click', function () { SP.activate(); advance('/api/player/prev', false); });
+
+  $('btn-play').addEventListener('click', function () {
+    var cur = currentSong();
+    if (!cur) { toast('Add a song first', true); return; }
+    SP.activate();
+    if (engine.kind && engine.songId === cur.id) {
+      if (engine.kind === 'local') {
+        if (audio.paused) audio.play().catch(function () { toast('Could not play the audio file', true); });
+        else audio.pause();
+      } else {
+        SP.toggle().catch(fail);
+      }
+    } else {
+      playSong(cur);
+    }
+  });
+
+  $('btn-repeat').addEventListener('click', function () {
+    api('POST', '/api/player/repeat').then(applyState).catch(fail);
+  });
+
+  $('seek').addEventListener('input', function () {
+    seeking = true;
+    fillSlider($('seek'));
+    $('np-elapsed').textContent = fmt($('seek').value);
+  });
+  $('seek').addEventListener('change', function () {
+    var sec = parseInt($('seek').value, 10);
+    seeking = false;
+    if (engine.kind === 'local') {
+      audio.currentTime = sec;
+    } else if (engine.kind === 'spotify') {
+      engine.pos = sec;
+      engine.stamp = performance.now();
+      SP.seek(sec * 1000).catch(fail);
+    }
+  });
+
+  try { var saved = localStorage.getItem('volume'); if (saved !== null) $('volume').value = saved; } catch (e) { /* storage blocked */ }
+  audio.volume = volume();
+  fillSlider($('volume'));
+  $('volume').addEventListener('input', function () {
+    fillSlider($('volume'));
+    audio.volume = volume();
+    SP.setVolume(volume()).catch(function () {});
+    try { localStorage.setItem('volume', $('volume').value); } catch (e) { /* ignore */ }
+  });
+
+  $('btn-reverse').addEventListener('click', function () {
+    api('POST', '/api/playlist/reverse').then(applyState).catch(fail);
+  });
+  $('btn-view-reverse').addEventListener('click', function () {
+    viewReversed = !viewReversed;
+    // Fetch from the API so the order really comes from the tail->prev traversal.
+    api('GET', viewReversed ? '/api/songs/reverse' : '/api/songs').then(function (d) {
+      state.songs = viewReversed ? d.songs.slice().reverse() : d.songs; // keep state in list order
+      renderStats();
+      if (searchQuery) runFilter(); else renderList(d.songs);
+    }).catch(fail);
+  });
+  $('btn-sort').addEventListener('click', function () {
+    api('POST', '/api/playlist/sort', { by: $('sort-by').value }).then(applyState).catch(fail);
+  });
+  $('btn-shuffle').addEventListener('click', function () {
+    api('POST', '/api/playlist/shuffle').then(applyState).catch(fail);
+  });
+  $('btn-save').addEventListener('click', function () {
+    api('POST', '/api/playlist/save').then(function (d) { toast(d.message); }).catch(fail);
+  });
+  $('btn-load').addEventListener('click', function () {
+    api('POST', '/api/playlist/load').then(applyState).catch(fail);
+  });
+
+  var filterTimer = null;
+  $('search').addEventListener('input', function () {
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(function () {
+      searchQuery = $('search').value.trim();
+      if (searchQuery) runFilter(); else { searchSeq++; render(); }
+    }, 250);
+  });
+
+  /* ---------- manual add form ---------- */
+
+  $('f-at').addEventListener('change', function () {
+    $('pos-label').hidden = $('f-at').value !== 'position';
+  });
+
+  $('add-form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var min = parseInt($('f-min').value, 10), sec = parseInt($('f-sec').value, 10);
+    if (isNaN(min) || isNaN(sec) || min < 0) return toast('Enter valid minutes and seconds', true);
+    if (sec < 0 || sec > 59) return toast('Seconds must be between 0 and 59', true);
+    if (min === 0 && sec === 0) return toast('Duration must be longer than 0 seconds', true);
+    var body = {
+      title: $('f-title').value, artist: $('f-artist').value,
+      minutes: min, seconds: sec, at: $('f-at').value
+    };
+    if (body.at === 'position') {
+      body.position = parseInt($('f-pos').value, 10);
+      if (isNaN(body.position)) return toast('Enter a position', true);
+    }
+    api('POST', '/api/songs', body).then(function (d) {
+      $('f-title').value = '';
+      $('f-artist').value = '';
+      $('f-title').focus();
+      applyState(d);
+    }).catch(fail);
+  });
+
+  /* ---------- Find songs: shared "add to" options ---------- */
+
+  $('ins-at').addEventListener('change', function () {
+    $('ins-pos-label').hidden = $('ins-at').value !== 'position';
+  });
+
+  // Adds the insert mode (and position) to a request body; null when the position is invalid.
+  function withInsertMode(body) {
+    body.at = $('ins-at').value;
+    if (body.at === 'position') {
+      body.position = parseInt($('ins-pos').value, 10);
+      if (isNaN(body.position)) { toast('Enter a position', true); return null; }
+    }
+    return body;
+  }
+
+  function resultRow(img, title, artist, dur, added, onAdd) {
+    var li = document.createElement('li');
+    li.appendChild(thumb(img, 'thumb big'));
+    var info = document.createElement('div');
+    info.className = 'info';
+    var a = document.createElement('div'); a.className = 'r-title'; a.textContent = title;
+    var b = document.createElement('div'); b.className = 'r-artist'; b.textContent = artist;
+    info.appendChild(a); info.appendChild(b);
+    li.appendChild(info);
+    if (dur) {
+      var d = document.createElement('span'); d.className = 'r-dur'; d.textContent = fmt(dur);
+      li.appendChild(d);
+    }
+    var btn = document.createElement('button');
+    btn.className = 'small';
+    btn.textContent = added ? 'Added' : 'Add';
+    btn.disabled = added;
+    btn.addEventListener('click', function () { onAdd(btn); });
+    li.appendChild(btn);
+    return li;
+  }
+
+  /* ---------- Spotify search ---------- */
+
+  var sp = { q: '', offset: 0, tracks: [], hasMore: false, busy: false, searched: false };
+
+  function inPlaylist(field, value) {
+    return state.songs.some(function (s) { return s[field] === value; });
+  }
+
+  function renderResults() {
+    var ul = $('sp-results');
+    ul.textContent = '';
+    sp.tracks.forEach(function (t) {
+      ul.appendChild(resultRow(t.image_url, t.title, t.artist, t.duration, inPlaylist('spotify_uri', t.uri),
+        function (btn) { addSpotifyTrack(t, btn); }));
+    });
+    if (sp.searched && sp.tracks.length === 0) {
+      var li = document.createElement('li');
+      li.className = 'none';
+      li.textContent = 'No tracks found.';
+      ul.appendChild(li);
+    }
+    $('sp-more').hidden = !sp.hasMore;
+    $('sp-more').disabled = sp.busy;
+  }
+
+  function runSpotifySearch(more) {
+    if (!SP.isConfigured()) return fail(SP.SpotifyError('not_configured'));
+    if (!SP.isLoggedIn()) return fail(SP.SpotifyError('not_logged_in'));
+    var q = more ? sp.q : $('sp-q').value.trim();
+    if (!q) return toast('Type something to search for', true);
+    if (!more) sp = { q: q, offset: 0, tracks: [], hasMore: false, busy: false, searched: false };
+    sp.busy = true;
+    renderResults();
+    SP.search(sp.q, sp.offset).then(function (r) {
+      sp.tracks = sp.tracks.concat(r.tracks);
+      sp.offset += r.tracks.length;
+      sp.hasMore = r.hasMore && r.tracks.length > 0;
+      sp.searched = true;
+    }).catch(fail).then(function () {
+      sp.busy = false;
+      renderResults();
+    });
+  }
+
+  $('sp-form').addEventListener('submit', function (e) { e.preventDefault(); runSpotifySearch(false); });
+  $('sp-more').addEventListener('click', function () { runSpotifySearch(true); });
+
+  function addSpotifyTrack(t, btn) {
+    var body = withInsertMode({
+      title: trunc(t.title, 99), artist: trunc(t.artist, 99), duration: t.duration,
+      spotify_uri: t.uri, image_url: t.image_url.length < 300 ? t.image_url : '', source: 'spotify'
+    });
+    if (!body) return;
+    btn.disabled = true;
+    api('POST', '/api/songs', body).then(applyState).catch(function (e) { btn.disabled = false; fail(e); });
+  }
+
+  /* ---------- Local MP3 files (music/ folder) ---------- */
+
+  var localFiles = [];
+
+  function loadLocal() {
+    return api('GET', '/api/local-files').then(function (d) {
+      localFiles = (d.files || []).slice().sort(function (a, b) { return a.name.localeCompare(b.name); });
+      renderLocal();
+    }).catch(function () { /* optional feature: stay quiet */ });
+  }
+
+  function renderLocal() {
+    var ul = $('local-list');
+    ul.textContent = '';
+    localFiles.forEach(function (f) {
+      var base = f.name.replace(/\.mp3$/i, '');
+      ul.appendChild(resultRow('', base, 'Local file', 0, inPlaylist('audio_url', f.url),
+        function (btn) { addLocalFile(f, btn); }));
+    });
+    $('local-empty').hidden = localFiles.length > 0;
+  }
+
+  function audioDuration(url) {
+    return new Promise(function (resolve, reject) {
+      var a = new Audio();
+      a.preload = 'metadata';
+      a.onloadedmetadata = function () {
+        if (isFinite(a.duration) && a.duration > 0) resolve(Math.max(1, Math.round(a.duration)));
+        else reject(new Error('Could not read the length of that MP3.'));
+      };
+      a.onerror = function () { reject(new Error('Could not read that MP3 file.')); };
+      a.src = url;
+    });
+  }
+
+  function addLocalFile(f, btn) {
+    var base = f.name.replace(/\.mp3$/i, ''), title = base, artist = 'Local file';
+    var dash = base.indexOf(' - ');                 // "Artist - Title.mp3"
+    if (dash > 0) { artist = base.slice(0, dash); title = base.slice(dash + 3); }
+    btn.disabled = true;
+    audioDuration(f.url).then(function (duration) {
+      var body = withInsertMode({
+        title: trunc(title, 99), artist: trunc(artist, 99), duration: duration,
+        source: 'local', audio_url: f.url
+      });
+      if (!body) { btn.disabled = false; return; }
+      return api('POST', '/api/songs', body).then(applyState);
+    }).catch(function (e) { btn.disabled = false; fail(e); });
+  }
+
+  $('local-refresh').addEventListener('click', function () { loadLocal().then(function () { toast('Music folder rescanned'); }); });
+
+  /* ---------- Spotify login ---------- */
+
+  function renderAuth() {
+    var configured = SP.isConfigured(), logged = SP.isLoggedIn();
+    $('sp-login').hidden = logged;
+    $('sp-login').disabled = !configured;
+    $('sp-logout').hidden = !logged;
+    if (!logged) { $('sp-user').hidden = true; }
+  }
+
+  function loadMe() {
+    SP.me().then(function (m) {
+      $('sp-user').textContent = m.display_name || m.id || 'Spotify user';
+      $('sp-user').hidden = false;
+      if (m.product && m.product !== 'premium') fail(SP.SpotifyError('premium'));
+    }).catch(fail);
+  }
+
+  $('sp-login').addEventListener('click', function () { SP.login().catch(fail); });
+  $('sp-logout').addEventListener('click', function () {
+    stopEngine();
+    SP.logout();
+    sp = { q: '', offset: 0, tracks: [], hasMore: false, busy: false, searched: false };
+    renderAuth();
+    renderResults();
+    toast('Logged out of Spotify');
+  });
+
+  /* ---------- start ---------- */
+
+  renderAuth();
+  loadAll();
+  loadLocal();
+  if (!SP.isConfigured()) showBanner(MSG.not_configured);
+
+  SP.handleCallback().then(function (justLoggedIn) {
+    renderAuth();
+    if (SP.isLoggedIn()) {
+      SP.scheduleRefresh();
+      loadMe();
+      startSpotifyPlayer().catch(fail);       // duplicate toasts are swallowed
+      if (justLoggedIn) toast('Logged in to Spotify');
+    }
+  }).catch(function (e) { renderAuth(); fail(e); });
+})();
+
+==============================================================================
+9. frontend/spotify.js
+Spotify login (PKCE), search and Web Playback SDK
+==============================================================================
+/*
+ * spotify.js - everything that talks to Spotify, in the browser only.
+ *
+ *   - Authorization Code flow with PKCE (no client secret anywhere)
+ *   - token storage + refresh before expiry
+ *   - Web API calls (search, play, transfer playback) with friendly errors
+ *   - Web Playback SDK player
+ *
+ * The C backend never sees a token.  It only stores spotify_uri strings and
+ * decides which song is next/previous; app.js then asks this file to play it.
+ */
+(function () {
+  'use strict';
+
+  var cfg = window.SPOTIFY_CONFIG || {};
+  var REDIRECT_URI = cfg.redirectUri || 'http://127.0.0.1:8080/callback';
+  var SCOPES = 'streaming user-read-email user-read-private user-modify-playback-state';
+  var AUTH_URL = 'https://accounts.spotify.com/authorize';
+  var TOKEN_URL = 'https://accounts.spotify.com/api/token';
+  var API = 'https://api.spotify.com/v1';
+  var TOKEN_KEY = 'sp_token';
+
+  /* ---------- errors with messages meant for the user ---------- */
+
+  var MESSAGES = {
+    not_configured: 'Spotify is not configured. Copy frontend/config.example.js to frontend/config.js and set your Client ID.',
+    not_logged_in: 'You are not logged in to Spotify. Click "Login with Spotify" first.',
+    expired: 'Your Spotify session expired. Please log in again.',
+    premium: 'Spotify Premium is required to play music in the browser. Search still works, playback does not.',
+    drm: 'This browser cannot play Spotify audio (no DRM / Widevine support). Please use Chrome or Edge.',
+    network: 'Network problem: could not reach Spotify. Check your internet connection and try again.',
+    forbidden: 'Spotify refused the request (403). In Development Mode your account must be added under "User Management" in the Spotify Dashboard.'
+  };
+
+  function SpotifyError(code, message, extra) {
+    var e = new Error(message || MESSAGES[code] || 'Spotify error');
+    e.name = 'SpotifyError';
+    e.code = code;
+    if (extra) for (var k in extra) e[k] = extra[k];
+    return e;
+  }
+
+  /* ---------- token storage ---------- */
+
+  function loadToken() {
+    try { return JSON.parse(localStorage.getItem(TOKEN_KEY)); } catch (e) { return null; }
+  }
+  function saveToken(t) {
+    try { localStorage.setItem(TOKEN_KEY, JSON.stringify(t)); } catch (e) { /* storage blocked */ }
+    memToken = t;
+  }
+  function clearToken() {
+    try { localStorage.removeItem(TOKEN_KEY); } catch (e) { /* ignore */ }
+    memToken = null;
+  }
+  var memToken = loadToken();
+
+  function isConfigured() {
+    return !!cfg.clientId && cfg.clientId !== 'YOUR_SPOTIFY_CLIENT_ID';
+  }
+  function isLoggedIn() { return !!(memToken && memToken.refresh); }
+
+  /* ---------- PKCE ---------- */
+
+  function randomString(len) {
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+    var bytes = new Uint8Array(len), out = '';
+    crypto.getRandomValues(bytes);
+    for (var i = 0; i < len; i++) out += chars[bytes[i] % chars.length];
+    return out;
+  }
+
+  function base64url(buf) {
+    var s = '', bytes = new Uint8Array(buf);
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function sha256(text) {
+    return crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  }
+
+  // Redirects the browser to Spotify's consent page.
+  function login() {
+    if (!isConfigured()) return Promise.reject(SpotifyError('not_configured'));
+    if (!window.crypto || !crypto.subtle)
+      return Promise.reject(SpotifyError('api', 'Login needs a secure context. Open the app at http://127.0.0.1:8080 (not a LAN address).'));
+    var verifier = randomString(64), state = randomString(16);
+    return sha256(verifier).then(function (hash) {
+      try {
+        sessionStorage.setItem('sp_verifier', verifier);
+        sessionStorage.setItem('sp_state', state);
+      } catch (e) { throw SpotifyError('api', 'Browser storage is blocked; cannot log in.'); }
+      var params = {
+        client_id: cfg.clientId, response_type: 'code', redirect_uri: REDIRECT_URI,
+        code_challenge_method: 'S256', code_challenge: base64url(hash),
+        scope: SCOPES, state: state
+      };
+      // encodeURIComponent writes spaces as %20; URLSearchParams would write "+",
+      // which Spotify rejects in the scope list (error "invalid_scope").
+      var query = Object.keys(params).map(function (k) {
+        return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+      }).join('&');
+      window.location.assign(AUTH_URL + '?' + query);
+    });
+  }
+
+  function tokenRequest(params) {
+    var body = new URLSearchParams(params);
+    return fetch(TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    }).catch(function () { throw SpotifyError('network'); })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (d) {
+          if (!res.ok) throw SpotifyError('token_http', null, { status: res.status, detail: d.error_description || d.error });
+          return d;
+        });
+      });
+  }
+
+  function storeTokenResponse(d, oldRefresh) {
+    saveToken({
+      access: d.access_token,
+      refresh: d.refresh_token || oldRefresh,       // refresh responses may omit a new refresh token
+      expires_at: Date.now() + (d.expires_in || 3600) * 1000
+    });
+    scheduleRefresh();
+  }
+
+  // Call once on page load.  On /callback it finishes the login; resolves true if logged in just now.
+  function handleCallback() {
+    if (window.location.pathname !== '/callback') return Promise.resolve(false);
+    var p = new URLSearchParams(window.location.search);
+    var code = p.get('code'), err = p.get('error'), state = p.get('state');
+    var verifier = null, expected = null;
+    try { verifier = sessionStorage.getItem('sp_verifier'); expected = sessionStorage.getItem('sp_state'); } catch (e) { /* ignore */ }
+    try { sessionStorage.removeItem('sp_verifier'); sessionStorage.removeItem('sp_state'); } catch (e) { /* ignore */ }
+    history.replaceState(null, '', '/');            // never leave the code in the address bar
+
+    if (err) return Promise.reject(SpotifyError('api', err === 'access_denied' ? 'Login was cancelled.' : 'Spotify login failed: ' + err));
+    if (!code || !verifier || !state || state !== expected)
+      return Promise.reject(SpotifyError('api', 'Login could not be verified. Please try logging in again.'));
+    return tokenRequest({
+      client_id: cfg.clientId, grant_type: 'authorization_code', code: code,
+      redirect_uri: REDIRECT_URI, code_verifier: verifier
+    }).then(function (d) { storeTokenResponse(d); return true; })
+      .catch(function (e) {
+        if (e.code === 'token_http') throw SpotifyError('api', 'Spotify rejected the login (' + (e.detail || e.status) + '). Check the Client ID and the Redirect URI in the Dashboard.');
+        throw e;
+      });
+  }
+
+  var refreshing = null, refreshTimer = null;
+
+  function refreshToken() {
+    if (refreshing) return refreshing;
+    if (!memToken || !memToken.refresh) return Promise.reject(SpotifyError('not_logged_in'));
+    var old = memToken.refresh;
+    refreshing = tokenRequest({ grant_type: 'refresh_token', refresh_token: old, client_id: cfg.clientId })
+      .then(function (d) { storeTokenResponse(d, old); return memToken.access; })
+      .catch(function (e) {
+        if (e.code === 'token_http') { clearToken(); throw SpotifyError('expired'); }
+        throw e;
+      })
+      .then(function (v) { refreshing = null; return v; }, function (e) { refreshing = null; throw e; });
+    return refreshing;
+  }
+
+  // Refresh one minute before the token runs out.
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    if (!memToken) return;
+    var wait = Math.max(5000, memToken.expires_at - Date.now() - 60000);
+    refreshTimer = setTimeout(function () { refreshToken().catch(function () { /* surfaced on next use */ }); }, wait);
+  }
+
+  // Always returns a valid access token (refreshing if it is about to expire).
+  function getToken() {
+    if (!isLoggedIn()) return Promise.reject(SpotifyError('not_logged_in'));
+    if (memToken.expires_at - Date.now() < 60000) return refreshToken();
+    return Promise.resolve(memToken.access);
+  }
+
+  function logout() {
+    clearTimeout(refreshTimer);
+    clearToken();
+    if (player) { try { player.disconnect(); } catch (e) { /* ignore */ } }
+    player = null; deviceId = null; readyPromise = null;
+  }
+
+  /* ---------- Web API ---------- */
+
+  function apiFetch(method, path, body, isRetry) {
+    return getToken().then(function (token) {
+      var opts = { method: method, headers: { Authorization: 'Bearer ' + token } };
+      if (body !== undefined) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      return fetch(API + path, opts).catch(function () { throw SpotifyError('network'); });
+    }).then(function (res) {
+      if (res.status === 401 && !isRetry) {          // token rejected: force one refresh, retry once
+        if (memToken) memToken.expires_at = 0;
+        return refreshToken().then(function () { return apiFetch(method, path, body, true); });
+      }
+      if (res.status === 204) return null;
+      return res.json().catch(function () { return {}; }).then(function (d) {
+        if (res.ok) return d;
+        var msg = d && d.error && d.error.message, reason = d && d.error && d.error.reason;
+        if (res.status === 401) { clearToken(); throw SpotifyError('expired'); }
+        if (res.status === 429) {
+          var wait = parseInt(res.headers.get('Retry-After'), 10);
+          throw SpotifyError('rate_limit', 'Spotify rate limit reached (429). ' +
+            (wait ? 'Try again in ' + wait + ' seconds.' : 'Wait a little and try again.'), { retryAfter: wait || null });
+        }
+        if (res.status === 403) {
+          if (reason === 'PREMIUM_REQUIRED' || /premium/i.test(msg || '')) throw SpotifyError('premium');
+          throw SpotifyError('forbidden', MESSAGES.forbidden + (msg ? ' (' + msg + ')' : ''), { status: 403 });
+        }
+        throw SpotifyError('api', 'Spotify error ' + res.status + (msg ? ': ' + msg : ''), { status: res.status, reason: reason });
+      });
+    });
+  }
+
+  function pickImage(images) {
+    if (!images || !images.length) return '';
+    var sorted = images.slice().sort(function (a, b) { return (a.width || 0) - (b.width || 0); });
+    for (var i = 0; i < sorted.length; i++) if ((sorted[i].width || 0) >= 200) return sorted[i].url;
+    return sorted[sorted.length - 1].url;
+  }
+
+  // One page of results (Spotify allows at most 10 per request here).
+  function search(q, offset) {
+    var qs = new URLSearchParams({ q: q, type: 'track', limit: '10', offset: String(offset || 0) });
+    return apiFetch('GET', '/search?' + qs.toString()).then(function (d) {
+      var t = (d && d.tracks) || { items: [] };
+      var items = (t.items || []).filter(Boolean).map(function (tr) {
+        return {
+          uri: tr.uri,
+          title: tr.name,
+          artist: (tr.artists || []).map(function (a) { return a.name; }).join(', '),
+          duration: Math.max(1, Math.round((tr.duration_ms || 0) / 1000)),
+          image_url: pickImage(tr.album && tr.album.images)
+        };
+      });
+      var hasMore = t.next ? true : (t.next === undefined && items.length === 10);
+      return { tracks: items, hasMore: hasMore, total: t.total };
+    });
+  }
+
+  function me() { return apiFetch('GET', '/me'); }
+
+  /* ---------- Web Playback SDK ---------- */
+
+  var player = null, deviceId = null, readyPromise = null;
+  var handlers = { state: function () {}, ended: function () {}, error: function () {}, ready: function () {} };
+  var endHandled = false;
+  var initialVolume = 0.8;
+
+  // A finished track shows up as: paused, position 0, and the current track also listed in previous_tracks.
+  function isTrackEnd(state) {
+    if (!state || !state.paused || state.position !== 0) return false;
+    var tw = state.track_window;
+    if (!tw || !tw.current_track) return false;
+    return (tw.previous_tracks || []).some(function (t) { return t.id === tw.current_track.id; });
+  }
+
+  function drmCheck() {
+    if (!navigator.requestMediaKeySystemAccess) return Promise.reject(SpotifyError('drm'));
+    return navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{
+      initDataTypes: ['cenc'],
+      audioCapabilities: [{ contentType: 'audio/mp4;codecs="mp4a.40.2"' }]
+    }]).catch(function () { throw SpotifyError('drm'); });
+  }
+
+  function loadSdkScript() {
+    return new Promise(function (resolve, reject) {
+      if (window.Spotify) return resolve();
+      window.onSpotifyWebPlaybackSDKReady = resolve;
+      var s = document.createElement('script');
+      s.src = 'https://sdk.scdn.co/spotify-player.js';
+      s.async = true;
+      s.onerror = function () { reject(SpotifyError('network', 'Could not load the Spotify player script (sdk.scdn.co). Check your connection or ad blocker.')); };
+      document.head.appendChild(s);
+    });
+  }
+
+  // Creates the in-browser player.  Resolves with the device id once Spotify reports it ready.
+  function initPlayer(h, volume) {
+    if (readyPromise) return readyPromise;
+    handlers = Object.assign(handlers, h || {});
+    if (typeof volume === 'number') initialVolume = volume;
+
+    readyPromise = drmCheck().then(loadSdkScript).then(function () {
+      return new Promise(function (resolve, reject) {
+        player = new window.Spotify.Player({
+          name: 'Playlist Manager (C linked list)',
+          getOAuthToken: function (cb) {
+            getToken().then(cb).catch(function (e) { handlers.error(e); });
+          },
+          volume: initialVolume
+        });
+
+        player.addListener('ready', function (d) {
+          deviceId = d.device_id;
+          // make our browser the active device (does not start anything yet)
+          apiFetch('PUT', '/me/player', { device_ids: [deviceId], play: false })
+            .catch(function (e) { if (e.code !== 'api') handlers.error(e); });
+          handlers.ready(deviceId);
+          resolve(deviceId);
+        });
+        player.addListener('not_ready', function () { deviceId = null; });
+        player.addListener('initialization_error', function () { var e = SpotifyError('drm'); handlers.error(e); reject(e); });
+        player.addListener('authentication_error', function () {
+          // the SDK could not use our token: try one refresh, otherwise ask for a new login
+          refreshToken().catch(function (e) { handlers.error(e); });
+        });
+        player.addListener('account_error', function () { var e = SpotifyError('premium'); handlers.error(e); reject(e); });
+        player.addListener('playback_error', function (d) {
+          handlers.error(SpotifyError('api', 'Spotify playback error: ' + ((d && d.message) || 'unknown')));
+        });
+        player.addListener('player_state_changed', function (state) {
+          if (!state) return;
+          handlers.state({
+            position: state.position, duration: state.duration, paused: state.paused,
+            uri: state.track_window && state.track_window.current_track && state.track_window.current_track.uri
+          });
+          if (isTrackEnd(state)) {
+            if (!endHandled) { endHandled = true; handlers.ended(); }
+          }
+        });
+        player.connect().then(function (ok) {
+          if (!ok) { var e = SpotifyError('api', 'Could not connect the Spotify player. Are you logged in with a Premium account?'); handlers.error(e); reject(e); }
+        });
+      });
+    });
+    var attempt = readyPromise;
+    attempt.catch(function () {                      // failed: tidy up so the next play attempt can retry
+      if (readyPromise === attempt) {
+        if (player) { try { player.disconnect(); } catch (e) { /* ignore */ } }
+        player = null; deviceId = null; readyPromise = null;
+      }
+    });
+    return attempt;
+  }
+
+  function ensureDevice() {
+    if (!isLoggedIn()) return Promise.reject(SpotifyError('not_logged_in'));
+    if (!readyPromise) return Promise.reject(SpotifyError('api', 'The Spotify player is not started yet.'));
+    return Promise.race([
+      readyPromise,
+      new Promise(function (_, rej) { setTimeout(function () { rej(SpotifyError('api', 'The Spotify player is still starting. Try again in a moment.')); }, 15000); })
+    ]);
+  }
+
+  // Plays exactly one track URI on the browser device.
+  function play(uri) {
+    endHandled = false;
+    return ensureDevice().then(function (id) {
+      var url = '/me/player/play?device_id=' + encodeURIComponent(id);
+      return apiFetch('PUT', url, { uris: [uri] }).catch(function (e) {
+        if (e.status !== 404) throw e;               // "device not found": transfer once, then retry
+        return apiFetch('PUT', '/me/player', { device_ids: [id], play: false })
+          .then(function () { return apiFetch('PUT', url, { uris: [uri] }); });
+      });
+    });
+  }
+
+  function guard(fn) { return player ? fn(player) : Promise.resolve(); }
+  function pause() { return guard(function (p) { return p.pause(); }); }
+  function resume() { return guard(function (p) { return p.resume(); }); }
+  function toggle() { return guard(function (p) { return p.togglePlay(); }); }
+  function seek(ms) { return guard(function (p) { return p.seek(ms); }); }
+  function setVolume(v) { initialVolume = v; return guard(function (p) { return p.setVolume(v); }); }
+  function activate() { if (player && player.activateElement) { try { player.activateElement(); } catch (e) { /* ignore */ } } }
+  function hasPlayer() { return !!player; }
+
+  window.SP = {
+    isConfigured: isConfigured, isLoggedIn: isLoggedIn, login: login, logout: logout,
+    handleCallback: handleCallback, scheduleRefresh: scheduleRefresh, getToken: getToken,
+    search: search, me: me,
+    initPlayer: initPlayer, play: play, pause: pause, resume: resume, toggle: toggle,
+    seek: seek, setVolume: setVolume, activate: activate, hasPlayer: hasPlayer,
+    isTrackEnd: isTrackEnd, SpotifyError: SpotifyError, MESSAGES: MESSAGES
+  };
+})();
+
+==============================================================================
+10. frontend/fx.js
+Visual effects: floating music notes and animated cursor
+==============================================================================
+/*
+ * fx.js - visual effects only (nothing here touches playlist or Spotify logic):
+ *   - drifting music notes in the background
+ *   - custom cursor: glowing dot + trailing ring, a short trail of notes, a burst on click
+ * Disabled automatically for "reduce motion"; cursor effects are skipped on touch screens.
+ */
+(function () {
+  'use strict';
+
+  var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var fine = window.matchMedia && matchMedia('(pointer: fine)').matches;
+  var GLYPHS = ['♪', '♫', '♬', '♩'];
+  var COLORS = ['179,157,255', '124,92,255', '255,122,217', '110,231,255', '255,214,102'];
+  var FONT = '"Segoe UI Symbol","Apple Symbols","Noto Sans Symbols 2",serif';
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function pick(list) { return list[Math.floor(Math.random() * list.length)]; }
+
+  function makeCanvas(id, z) {
+    var c = document.createElement('canvas');
+    c.id = id;
+    c.setAttribute('aria-hidden', 'true');
+    c.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:' + z;
+    document.body.appendChild(c);
+    return c;
+  }
+
+  var bg = makeCanvas('fx-bg', 0);
+  var bctx = bg.getContext('2d');
+  var top = null, tctx = null;
+  var W = 0, H = 0, dpr = 1;
+
+  /* ---------- background notes ---------- */
+
+  var notes = [];
+
+  function newNote(spread) {
+    var depth = Math.random();                       // 0 = far (small, faint), 1 = near
+    return {
+      x: rand(0, W), y: spread ? rand(0, H) : H + rand(20, 120),
+      size: 20 + depth * 46, vy: 12 + depth * 30, amp: rand(10, 40), sway: rand(0.4, 1.1),
+      phase: rand(0, 6.28), rot: rand(-0.5, 0.5), vr: rand(-0.25, 0.25),
+      glyph: pick(GLYPHS), color: pick(COLORS), alpha: 0.14 + depth * 0.30, baseX: 0
+    };
+  }
+
+  function seedNotes() {
+    var count = Math.max(14, Math.min(34, Math.round(W / 48)));
+    notes = [];
+    for (var i = 0; i < count; i++) { var n = newNote(true); n.baseX = n.x; notes.push(n); }
+  }
+
+  function drawNote(ctx, n, x, y) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(n.rot);
+    ctx.font = n.size + 'px ' + FONT;
+    ctx.fillStyle = 'rgba(' + n.color + ',' + n.alpha + ')';
+    ctx.fillText(n.glyph, 0, 0);
+    ctx.restore();
+  }
+
+  function drawBackground(t) {
+    bctx.clearRect(0, 0, W, H);
+    for (var i = 0; i < notes.length; i++) {
+      var n = notes[i];
+      drawNote(bctx, n, n.baseX + Math.sin(n.phase + t * n.sway) * n.amp, n.y);
+    }
+  }
+
+  function stepBackground(dt) {
+    for (var i = 0; i < notes.length; i++) {
+      var n = notes[i];
+      n.y -= n.vy * dt;
+      n.rot += n.vr * dt;
+      if (n.y < -80) { var f = newNote(false); f.baseX = f.x; notes[i] = f; }
+    }
+  }
+
+  /* ---------- cursor + particles ---------- */
+
+  var parts = [];
+  var mx = -100, my = -100, rx = -100, ry = -100, lastX = -100, lastY = -100;
+  var dot = null, ring = null, shown = false;
+
+  function spawn(x, y, vx, vy, size, life) {
+    if (parts.length > 120) parts.shift();
+    parts.push({ x: x, y: y, vx: vx, vy: vy, size: size, life: life, max: life,
+      glyph: pick(GLYPHS), color: pick(COLORS), rot: rand(-0.6, 0.6), vr: rand(-1.5, 1.5) });
+  }
+
+  function burst(x, y) {
+    for (var i = 0; i < 10; i++) {
+      var a = (i / 10) * 6.283 + rand(-0.2, 0.2), s = rand(60, 150);
+      spawn(x, y, Math.cos(a) * s, Math.sin(a) * s - 30, rand(14, 26), rand(0.7, 1.2));
+    }
+  }
+
+  function stepParticles(dt) {
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var p = parts[i];
+      p.life -= dt;
+      if (p.life <= 0) { parts.splice(i, 1); continue; }
+      p.x += p.vx * dt; p.y += p.vy * dt; p.vy -= 25 * dt; p.vx *= 0.985; p.rot += p.vr * dt;
+    }
+  }
+
+  function drawParticles() {
+    tctx.clearRect(0, 0, W, H);
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i], a = Math.max(0, p.life / p.max);
+      tctx.save();
+      tctx.translate(p.x, p.y);
+      tctx.rotate(p.rot);
+      tctx.font = p.size + 'px ' + FONT;
+      tctx.shadowColor = 'rgba(' + p.color + ',0.9)';
+      tctx.shadowBlur = 10;
+      tctx.fillStyle = 'rgba(' + p.color + ',' + (a * 0.9) + ')';
+      tctx.fillText(p.glyph, 0, 0);
+      tctx.restore();
+    }
+  }
+
+  var HOT = 'button, a, select, input, label, summary, [role="button"], td.title, .slider';
+
+  function initCursor() {
+    top = makeCanvas('fx-top', 9998);
+    tctx = top.getContext('2d');
+    dot = document.createElement('div'); dot.id = 'cur-dot';
+    ring = document.createElement('div'); ring.id = 'cur-ring';
+    dot.setAttribute('aria-hidden', 'true'); ring.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(ring);
+    document.body.appendChild(dot);
+    document.documentElement.classList.add('fx-cursor');
+
+    document.addEventListener('mousemove', function (e) {
+      mx = e.clientX; my = e.clientY;
+      if (!shown) { shown = true; rx = mx; ry = my; dot.style.opacity = ring.style.opacity = '1'; }
+      dot.style.transform = 'translate3d(' + mx + 'px,' + my + 'px,0)';
+      var dx = mx - lastX, dy = my - lastY;
+      if (dx * dx + dy * dy > 38 * 38) {                       // a note every ~38 px of movement
+        lastX = mx; lastY = my;
+        spawn(mx, my, rand(-14, 14), rand(-40, -15), rand(13, 22), rand(0.8, 1.3));
+      }
+    }, { passive: true });
+
+    document.addEventListener('mouseover', function (e) {
+      ring.classList.toggle('hot', !!(e.target.closest && e.target.closest(HOT)));
+    });
+    document.addEventListener('mousedown', function () { ring.classList.add('down'); });
+    document.addEventListener('mouseup', function () { ring.classList.remove('down'); });
+    document.addEventListener('click', function (e) { burst(e.clientX, e.clientY); });
+    document.documentElement.addEventListener('mouseleave', function () { shown = false; dot.style.opacity = ring.style.opacity = '0'; });
+  }
+
+  /* ---------- main loop ---------- */
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    [bg, top].forEach(function (c) { if (c) { c.width = W * dpr; c.height = H * dpr; } });
+    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (tctx) tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    seedNotes();
+    if (reduce) drawBackground(0);                    // still picture, no animation
+  }
+
+  var last = 0;
+  function frame(ts) {
+    var dt = Math.min(0.05, (ts - last) / 1000 || 0.016);
+    last = ts;
+    stepBackground(dt);
+    drawBackground(ts / 1000);
+    if (tctx) {
+      rx += (mx - rx) * 0.18; ry += (my - ry) * 0.18;
+      ring.style.transform = 'translate3d(' + rx + 'px,' + ry + 'px,0)';
+      stepParticles(dt);
+      drawParticles();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  if (!reduce && fine) initCursor();
+  resize();
+  window.addEventListener('resize', resize);
+  if (!reduce) requestAnimationFrame(frame);
+})();
+
+==============================================================================
+11. frontend/config.example.js
+Configuration template for the Spotify Client ID (copy to config.js)
+==============================================================================
+/*
+ * Copy this file to config.js and paste your Spotify Client ID.
+ * (config.js is listed in .gitignore.)  The Client ID is public by design -
+ * PKCE needs no client secret, and this app never uses one.
+ *
+ * Dashboard: https://developer.spotify.com/dashboard
+ *   Redirect URI  ->  http://127.0.0.1:8080/callback
+ */
+window.SPOTIFY_CONFIG = {
+  clientId: "YOUR_SPOTIFY_CLIENT_ID"
+};
